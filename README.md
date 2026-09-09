@@ -30,15 +30,21 @@ npm install -g ssh-persona              # the npm package; the command it instal
 The npm package is published as `ssh-persona` because npm blocks short `ssh`-prefixed
 names as possible typosquats. The command it installs is `sshid`, which is what you type.
 
-Then, and this part is not optional:
+Then:
 
 ```sh
-sshid setup     # installs the resolver, and the gh shim if you have gh
+sshid setup     # installs the gh shim, if you have gh
 sshid adopt     # imports any routing already on this machine
 sshid doctor
 ```
 
-Installing the package on its own changes nothing. `setup` is the opt-in.
+Installing the package on its own changes nothing — `setup` is the opt-in, and it is what
+puts the `gh` shim on your PATH.
+
+SSH routing works without `setup`: `sshid add` and `sshid route` write git config directly,
+and git picks the key up on the next command. `setup` is what you need for the **`gh` half**,
+because routing `gh` means putting a shim ahead of it on PATH, and no package install should
+do that to you silently. Run it unless you have no use for `gh`.
 
 ## How it works
 

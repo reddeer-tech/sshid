@@ -838,7 +838,7 @@ cmd_forget(){
     local ans=""
     if [ "$yes" = 1 ]; then ans="$n"
     elif [ -t 0 ]; then
-      red "  about to PERMANENTLY delete the private key at $KEYDIR/$n"
+      red "  about to PERMANENTLY delete the private key at $(printf '%s' "$KEYDIR/$n" | sed "s|$HOME|~|")"
       dim "    no backup here contains key material, and the key store may sync elsewhere."
       printf '    type the identity name to confirm: '; IFS= read -r ans
     else
@@ -847,12 +847,12 @@ cmd_forget(){
       ans=""
     fi
     if [ "$ans" = "$n" ]; then
-      rm -rf "${KEYDIR:?}/${n:?}" && grn "  deleted the private key at $KEYDIR/$n"
+      rm -rf "${KEYDIR:?}/${n:?}" && grn "  deleted the private key at $(printf '%s' "$KEYDIR/$n" | sed "s|$HOME|~|")"
     else
       [ -n "$ans" ] && yel "  name did not match — the key was kept."
     fi
   else
-    dim "  the key at $KEYDIR/$n was kept — an unrouted key costs nothing."
+    dim "  the key at $(printf '%s' "$KEYDIR/$n" | sed "s|$HOME|~|") was kept — an unrouted key costs nothing."
   fi
   dim "  remember to remove the public key from the GitHub/GitLab account too."
   return 0
