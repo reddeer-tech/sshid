@@ -120,6 +120,42 @@ printf '%s' "$out" | grep -qi 'PRIVATE' && no "LEAKED PRIVATE KEY MATERIAL" || o
 X pubkey nosuch >/dev/null 2>&1 && no "pubkey on unknown identity succeeded" || ok "unknown identity refused"
 X forget pk --force >/dev/null 2>&1
 
+section "rename moves EVERYTHING that names the identity"
+# Six things have to move together: the key dir, the identity record, every rule, the ssh
+# alias (including the Host name), the gh row, and the fragment. Missing one leaves a
+# half-renamed identity that looks fine until it silently uses the wrong key.
+X create test >/dev/null 2>&1
+X bind test --dir "$HOME/projects/Renamed" >/dev/null 2>&1
+export SSH_REPO_OK=1
+X bind test --org github.com:test-org --proof git@github.com:test-org/app.git >/dev/null 2>&1
+mkrepo "$HOME/projects/Renamed/app" "origin=git@github.com:test-org/app.git"
+fp_before=$(ssh-keygen -lf "$HOME/.skm/test/id_ed25519.pub" 2>/dev/null | awk '{print $2}')
+[ "$(resolved "$HOME/projects/Renamed/app")" = test ] && ok "routes as 'test' before the rename" || no "setup: $(resolved "$HOME/projects/Renamed/app")"
+
+X rename test production >/dev/null 2>&1
+[ -d "$HOME/.skm/production" ] && ok "key directory moved" || no "key directory not moved"
+[ -d "$HOME/.skm/test" ] && no "old key directory left behind" || ok "old key directory gone"
+[ "$(ssh-keygen -lf "$HOME/.skm/production/id_ed25519.pub" 2>/dev/null | awk '{print $2}')" = "$fp_before" ] && ok "same key material, not a new key" || no "KEY CHANGED"
+X list --no-count | grep -q production && ok "identity record renamed" || no "record not renamed"
+# Check the IDENTITY COLUMN, not the whole line: the org is called "test-org", so a bare
+# \btest\b matches inside it and the assertion passes for the wrong reason.
+X list --no-count | awk '{print $1}' | grep -qx test && no "old name still listed" || ok "old name gone from the list"
+[ -f "$HOME/.config/git/identities/production.gitconfig" ] && ok "fragment renamed" || no "fragment missing"
+[ -f "$HOME/.config/git/identities/test.gitconfig" ] && no "old fragment left behind" || ok "old fragment removed"
+[ "$(resolved "$HOME/projects/Renamed/app")" = production ] && ok "the repo follows the rename automatically" || no "repo: $(resolved "$HOME/projects/Renamed/app")"
+grep -q 'test-org' "$HOME/.gitconfig" && ok "the org rule survived (it names the ORG, not the identity)" || no "org rule lost"
+grep -q 'rule.*production' "$HOME/.config/sshid/identities.map" && ok "rules renamed in the manifest" || no "rules not renamed"
+X doctor >/dev/null 2>&1 && ok "doctor is clean after the rename" || no "doctor reports a problem"
+
+section "rename refuses what it should"
+X create other >/dev/null 2>&1
+X rename production other >/dev/null 2>&1 && no "renamed onto an existing identity" || ok "refuses an existing name"
+X rename production 'BAD NAME' >/dev/null 2>&1 && no "accepted an invalid name" || ok "refuses an invalid name"
+X rename production none >/dev/null 2>&1 && no "accepted a reserved name" || ok "refuses a reserved name"
+X rename nosuch whatever >/dev/null 2>&1 && no "renamed an unknown identity" || ok "refuses an unknown identity"
+[ "$(resolved "$HOME/projects/Renamed/app")" = production ] && ok "nothing broke through all those refusals" || no "a refusal damaged the routing"
+X forget production --force >/dev/null 2>&1; X forget other --force >/dev/null 2>&1
+
 section "export/import round-trips"
 X create beta >/dev/null 2>&1; X bind beta --dir "$HOME/projects/Beta" >/dev/null 2>&1
 X export > "$T/exp.tsv"

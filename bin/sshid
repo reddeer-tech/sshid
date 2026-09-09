@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.2"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.3"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -816,6 +816,74 @@ cmd_unbind(){
   man_unlock; grn "unbound"; return 0
 }
 
+# Renaming touches SIX things that must all move together: the key directory, the identity
+# record, every rule that names it, the ssh alias (including the Host name itself), the gh
+# identity row, and the fragment. Miss one and the identity is half-renamed — which looks
+# like working routing right up until the moment it silently uses the wrong key.
+cmd_rename(){
+  local old="${1:-}" new="${2:-}"
+  [ -n "$old" ] && [ -n "$new" ] || { echo "usage: sshid rename <old> <new>"; return 2; }
+  man_has "$old" || { red "unknown identity '$old'"; return 1; }
+  valid_name "$new" || { red "invalid name '$new' — lowercase letters, digits, . _ - ; must start alphanumeric; max 39"; return 2; }
+  reserved_name "$new" && { red "'$new' is a reserved word"; return 2; }
+  [ "$old" = "$new" ] && { dim "nothing to do — same name"; return 0; }
+  man_has "$new" && { red "identity '$new' already exists"; return 1; }
+  [ -n "$(keyfile_for "$new")" ] && { red "a key already exists at $(printf '%s' "$KEYDIR/$new" | sed "s|$HOME|~|") — refusing to write over it"; return 1; }
+
+  man_lock || return 1
+  local bk; bk=$(backup "rename-$old-to-$new")
+  # the key directory first: everything else is derived from where the key is
+  if [ -d "$KEYDIR/$old" ]; then
+    mv "$KEYDIR/$old" "$KEYDIR/$new" || { red "could not move the key directory"; man_unlock; return 1; }
+  fi
+  local tmp; tmp=$(mktemp)
+  python3 - "$MANIFEST" "$old" "$new" "$KEYDIR" > "$tmp" <<'PYR'
+import sys, os
+man, old, new, keydir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+for line in open(man, encoding='utf-8', errors='replace').read().splitlines():
+    if not line.strip() or line.lstrip().startswith('#'):
+        print(line); continue
+    f = line.split('\t')
+    k = f[0]
+    if k == 'identity' and len(f) > 1 and f[1] == old:
+        f[1] = new
+        if len(f) > 2 and f[2]:                       # the key path moved with the directory
+            f[2] = os.path.join(keydir, new, os.path.basename(f[2]))
+    elif k == 'baseline' and len(f) > 1 and f[1] == old:
+        f[1] = new
+    elif k == 'rule' and len(f) > 2 and f[2] == old:
+        f[2] = new
+    elif k == 'alias' and len(f) > 1 and f[1] == old:
+        f[1] = new
+        if len(f) > 3:                                # the Host name itself: github-old -> github-new
+            f[3] = f[3].replace(old, new, 1) if old in f[3] else f[3]
+    elif k == 'ghid' and len(f) > 1 and f[1] == old:
+        f[1] = new
+    print('\t'.join(f))
+PYR
+  if [ ! -s "$tmp" ]; then
+    red "refusing to rename: the manifest rewrite produced nothing"
+    [ -d "$KEYDIR/$new" ] && mv "$KEYDIR/$new" "$KEYDIR/$old"
+    rm -f "$tmp"; man_unlock; return 1
+  fi
+  mv -f "$tmp" "$MANIFEST"; chmod 0600 "$MANIFEST"
+  rm -f "$FRAGDIR/$old.gitconfig"
+  if ! apply_all; then
+    red "rename failed to apply — restoring from $bk"
+    [ -f "$bk/identities.map" ] && cp "$bk/identities.map" "$MANIFEST"
+    [ -d "$KEYDIR/$new" ] && [ ! -d "$KEYDIR/$old" ] && mv "$KEYDIR/$new" "$KEYDIR/$old"
+    [ -f "$bk/gitconfig" ] && cp "$bk/gitconfig" "$GITCONFIG"
+    man_unlock; return 1
+  fi
+  man_unlock
+  grn "renamed '$old' -> '$new'"
+  dim "  key      $(printf '%s' "$KEYDIR/$new" | sed "s|$HOME|~|")"
+  dim "  rules, ssh alias and gh mapping all moved with it"
+  dim "  backup   $(printf '%s' "$bk" | sed "s|$HOME|~|")"
+  dim "  check:   sshid whoami <a repo it covers>"
+  return 0
+}
+
 cmd_forget(){
   local n="${1:-}" force=0 delkey=0 yes=0 a
   shift 2>/dev/null || true
@@ -1062,6 +1130,7 @@ SET UP
   unbind <name> --org|--dir     remove one binding
   unbind <name> --all           remove every binding; keep the key and the record
   alias <name> [host]           add a Host entry for checking that identity
+  rename <old> <new>            rename an identity; key, rules and gh mapping follow
 
 GH
   gh list                       accounts, org map, identity map
@@ -1114,6 +1183,7 @@ main(){
              echo "  sshid bind ${2:-<name>} --dir <path>"; exit 2 ;;
     unroute) red "'unroute' is now 'unbind'."; echo "  sshid unbind ${2:-<name>} --org <host:org>"
              echo "  sshid unbind ${2:-<name>} --all      remove every binding"; exit 2 ;;
+    rename)                shift; cmd_rename "$@" ;;
     forget)                shift; cmd_forget "$@" ;;
     alias)                 shift; cmd_alias "$@" ;;
     gh)                    shift; cmd_gh "$@" ;;

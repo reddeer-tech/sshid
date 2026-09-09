@@ -114,6 +114,9 @@ an organisation until it has watched the key actually reach a real repository th
 
 Every change is snapshotted first, and `sshid undo` restores the last one.
 
+`sshid rename <old> <new>` renames an identity — the key directory, every binding, the ssh
+alias and the gh mapping all move with it, and repositories follow automatically.
+
 `sshid unbind <name> --all` removes every binding but keeps the key; `--org` or `--dir`
 removes just one. `sshid forget` removes the identity and *still* keeps the key, because an
 unbound key costs nothing and deleting one cannot be undone — `--delete-key` does that, and
