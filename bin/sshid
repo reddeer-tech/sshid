@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.1"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.2"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -668,16 +668,10 @@ PYS
 }
 
 # ── ADD / ROUTE ──────────────────────────────────────────────────────────────────────
-cmd_add(){
+cmd_create(){
   local n="${1:-}"; shift 2>/dev/null || true
-  local type=ed25519 adopt_key=0 showkey=0 a
-  for a in "$@"; do case "$a" in --type=*) type="${a#--type=}" ;; --existing-key) adopt_key=1 ;; --show-key) showkey=1 ;; esac; done
-  # --show-key prints ONLY the public key, so it can be piped straight to pbcopy.
-  if [ "$showkey" = 1 ]; then
-    local kk; kk=$(keyfile_for "$n")
-    [ -n "$kk" ] && [ -f "$kk.pub" ] || { red "no key for '$n'"; return 1; }
-    cat "$kk.pub"; return 0
-  fi
+  local type=ed25519 adopt_key=0 a
+  for a in "$@"; do case "$a" in --type=*) type="${a#--type=}" ;; --existing-key) adopt_key=1 ;; esac; done
   [ -n "$n" ] || { echo "usage: sshid add <name> [--type=ed25519|rsa] [--existing-key]"; return 2; }
   valid_name "$n" || { red "invalid name '$n' — lowercase letters, digits, . _ - ; must start alphanumeric; max 39"; return 2; }
   reserved_name "$n" && { red "'$n' is a reserved word"; return 2; }
@@ -716,19 +710,29 @@ cmd_add(){
     echo
     sed 's/^/    /' "$k.pub"
     echo
-    dim "    pbcopy < $(printf '%s' "$k.pub" | sed "s|$HOME|~|")     then paste into Settings -> SSH keys"
+    dim "    sshid pubkey $n | pbcopy     then paste into Settings -> SSH keys"
     echo
-    dim "  then prove it can reach a real repo, and route it:"
+    dim "  then prove it can reach a real repo, and bind it:"
     dim "    sshid verify $n git@github.com:<org>/<repo>.git"
-    dim "    sshid route $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
+    dim "    sshid bind $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
   else
     grn "identity '$n' recorded  (github: ${gh:--}  gitlab: ${gl:--})"
-    dim "  route it:  sshid route $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
+    dim "  bind it:  sshid bind $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
   fi
   return 0
 }
 
-cmd_route(){
+# Prints ONLY the public key, so it pipes straight to pbcopy. Never the private one.
+cmd_pubkey(){
+  local n="${1:-}"
+  [ -n "$n" ] || { echo "usage: sshid pubkey <name>"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  local k; k=$(keyfile_for "$n")
+  [ -n "$k" ] && [ -f "$k.pub" ] || { red "no public key found for '$n'"; return 1; }
+  cat "$k.pub"
+}
+
+cmd_bind(){
   local n="${1:-}"; shift 2>/dev/null || true
   local org="" dir="" proof="" force=0 a
   while [ $# -gt 0 ]; do
@@ -740,23 +744,23 @@ cmd_route(){
       *) red "unknown flag '$1'"; return 2 ;;
     esac
   done
-  [ -n "$n" ] || { echo "usage: sshid route <name> [--org host:org] [--dir path] --proof <repo-url>"; return 2; }
+  [ -n "$n" ] || { echo "usage: sshid bind <name> [--org host:org] [--dir path] --proof <repo-url>"; return 2; }
   man_has "$n" || { red "unknown identity '$n'"; return 1; }
   [ -n "$org$dir" ] || { echo "nothing to route: pass --org host:org and/or --dir path"; return 2; }
   # RULE: never route a key that has not been PROVEN to reach the repos. ssh -T only
   # proves authentication; a key can authenticate perfectly and be denied every repo.
   if [ -n "$org" ]; then
     if [ -n "$proof" ]; then
-      cmd_verify "$n" "$proof" || { red "not routing '$n' — the proof failed"; return 1; }
+      cmd_verify "$n" "$proof" || { red "not binding '$n' — the proof failed"; return 1; }
     elif [ "$force" = 0 ]; then
-      red "refusing to route an org without proof that '$n' can reach it."
+      red "refusing to bind an org without proof that '$n' can reach it."
       dim "  a key can authenticate fine and still be denied every repo — that is the"
       dim "  'repository not found' trap this tool exists to prevent."
-      dim "    sshid route $n --org $org --proof git@${org%%:*}:${org#*:}/<repo>.git"
+      dim "    sshid bind $n --org $org --proof git@${org%%:*}:${org#*:}/<repo>.git"
       dim "  or, if you accept the risk:  --force"
       return 1
     else
-      yel "routing '$n' to $org WITHOUT proof (--force)"
+      yel "binding '$n' to $org WITHOUT proof (--force)"
     fi
   fi
   man_lock || return 1
@@ -775,40 +779,41 @@ cmd_route(){
       man_del "$(printf 'ghorg\t%s' "$o")"; man_add "$(printf 'ghorg\t%s\t%s' "$o" "$ghacct")"; }; }
   apply_all || { red "failed to write config"; man_unlock; return 1; }
   man_unlock
-  grn "routed '$n'"; [ -n "$dir" ] && dim "  dir  $dir"; [ -n "$org" ] && dim "  org  $org"
-  dim "  check:  sshid whoami <a repo in that org>"
+  grn "bound '$n'"
+  [ -n "$dir" ] && dim "  dir  $(printf '%s' "$dir" | sed "s|$HOME|~|")"
+  [ -n "$org" ] && dim "  org  $org"
+  dim "  check:  sshid whoami <a repo it covers>"
   return 0
 }
 
-cmd_unroute(){
+cmd_unbind(){
   local n="${1:-}"; shift 2>/dev/null || true
-  local org="" dir=""
+  local org="" dir="" all=0
   while [ $# -gt 0 ]; do case "$1" in
       --org) org="${2:-}"; shift 2 ;; --org=*) org="${1#--org=}"; shift ;;
       --dir) dir="${2:-}"; shift 2 ;; --dir=*) dir="${1#--dir=}"; shift ;;
+      --all) all=1; shift ;;
       *) red "unknown flag '$1'"; return 2 ;; esac; done
-  [ -n "$n" ] || { echo "usage: sshid unroute <name> [--org host:org] [--dir path]"; return 2; }
+  [ -n "$n" ] || { echo "usage: sshid unbind <name> [--org host:org] [--dir path] [--all]"; return 2; }
   man_has "$n" || { red "unknown identity '$n'"; return 1; }
-  man_lock || return 1; backup "unroute-$n" >/dev/null
+  [ -n "$org$dir" ] || [ "$all" = 1 ] || {
+    echo "nothing to unbind: name --org / --dir, or --all to remove every binding"; return 2; }
+  if [ "$all" = 1 ]; then
+    cmd_impact "$n"
+    man_lock || return 1; backup "unbind-all-$n" >/dev/null
+    man_del "$(printf 'rule\tdir\t%s' "$n")"; man_del "$(printf 'rule\torg\t%s' "$n")"
+    apply_all || { man_unlock; return 1; }
+    man_unlock
+    grn "'$n' is no longer bound to anything. The key and the identity record are untouched."
+    dim "  to delete the identity as well:  sshid forget $n"
+    return 0
+  fi
+  man_lock || return 1; backup "unbind-$n" >/dev/null
   [ -n "$dir" ] && { dir="${dir%/}"; case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac; man_del "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"; }
   [ -n "$org" ] && { local h o; h="${org%%:*}"; o="${org#*:}"; [ "$h" = "$o" ] && { h=github.com; o="$org"; }
     man_del "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"; }
   apply_all || { man_unlock; return 1; }
-  man_unlock; grn "unrouted"; return 0
-}
-
-cmd_unbind(){
-  local n="${1:-}"
-  [ -n "$n" ] || { echo "usage: sshid unbind <name>"; return 2; }
-  man_has "$n" || { red "unknown identity '$n'"; return 1; }
-  cmd_impact "$n"
-  man_lock || return 1; backup "unbind-$n" >/dev/null
-  man_del "$(printf 'rule\tdir\t%s' "$n")"; man_del "$(printf 'rule\torg\t%s' "$n")"
-  apply_all || { man_unlock; return 1; }
-  man_unlock
-  grn "'$n' is no longer routed. The key and the identity record are untouched."
-  dim "  to delete the identity as well:  sshid forget $n"
-  return 0
+  man_unlock; grn "unbound"; return 0
 }
 
 cmd_forget(){
@@ -1048,13 +1053,14 @@ SET UP
   setup                         install the resolver and the gh shim (opt-in)
   adopt                         import routing already on this machine, and prove
                                 every repo still resolves identically
-  add <name> [--type=ed25519]   create a key and record it as an identity
+  create <name> [--type=rsa]    make a key and record it as an identity
                                 (ed25519 by default; rsa and ecdsa also work)
-  add <name> --show-key         print just the public key, to pipe to pbcopy
-  route <name> --org <host:org> --proof <repo-url>
+  pubkey <name>                 print its public key, to pipe to pbcopy
+  bind <name> --org <host:org> --proof <repo-url>
                                 bind an org to an identity, once proven
-  route <name> --dir <path>     bind a folder to an identity
-  unroute <name> --org|--dir    drop one rule
+  bind <name> --dir <path>      bind a folder to an identity
+  unbind <name> --org|--dir     remove one binding
+  unbind <name> --all           remove every binding; keep the key and the record
   alias <name> [host]           add a Host entry for checking that identity
 
 GH
@@ -1064,7 +1070,6 @@ GH
   gh login                      log in an additional gh account
 
 TEAR DOWN
-  unbind <name>                 stop routing it; keep the key and the record
   forget <name> [--force]       delete the identity; the key is kept by default
   forget <name> --delete-key    ...and delete the private key too (irreversible)
   undo [--yes]                  restore the last snapshot
@@ -1097,10 +1102,18 @@ main(){
     export)                shift; cmd_export "$@" ;;
     setup)                 shift; cmd_setup "$@" ;;
     adopt)                 shift; cmd_adopt "$@" ;;
-    add)                   shift; cmd_add "$@" ;;
-    route)                 shift; cmd_route "$@" ;;
-    unroute)               shift; cmd_unroute "$@" ;;
+    create)                shift; cmd_create "$@" ;;
+    pubkey)                shift; cmd_pubkey "$@" ;;
+    bind)                  shift; cmd_bind "$@" ;;
     unbind)                shift; cmd_unbind "$@" ;;
+    # Renamed verbs are DELETED, not aliased. Two words for one action is the ambiguity
+    # the rename was for, and a silent alias preserves it forever.
+    add)  red "'add' is now 'create' — it makes a key, it does not bind anything."
+          echo "  sshid create ${2:-<name>}"; echo "  sshid pubkey ${2:-<name>}      print its public key"; exit 2 ;;
+    route)   red "'route' is now 'bind'."; echo "  sshid bind ${2:-<name>} --org <host:org> --proof <repo-url>"
+             echo "  sshid bind ${2:-<name>} --dir <path>"; exit 2 ;;
+    unroute) red "'unroute' is now 'unbind'."; echo "  sshid unbind ${2:-<name>} --org <host:org>"
+             echo "  sshid unbind ${2:-<name>} --all      remove every binding"; exit 2 ;;
     forget)                shift; cmd_forget "$@" ;;
     alias)                 shift; cmd_alias "$@" ;;
     gh)                    shift; cmd_gh "$@" ;;
@@ -1112,8 +1125,8 @@ main(){
     # alias would preserve exactly the ambiguity the names were chosen to remove.
     remove|rm|delete)
       red "there is no 'remove' — it never said what it acted on."
-      echo "  sshid unbind <name>    stop routing it, keep the key"
-      echo "  sshid unroute <name> --org <host:org>    drop one rule"
+      echo "  sshid unbind <name> --all    stop binding it; keep the key"
+      echo "  sshid unbind <name> --org <host:org>    remove one binding"
       echo "  sshid forget <name>    delete the identity"
       exit 2 ;;
     *) red "unknown command '${1:-}'"; echo "  sshid help"; exit 2 ;;

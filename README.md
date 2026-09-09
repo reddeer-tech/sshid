@@ -41,7 +41,7 @@ sshid doctor
 Installing the package on its own changes nothing — `setup` is the opt-in, and it is what
 puts the `gh` shim on your PATH.
 
-SSH routing works without `setup`: `sshid add` and `sshid route` write git config directly,
+SSH routing works without `setup`: `sshid create` and `sshid bind` write git config directly,
 and git picks the key up on the next command. `setup` is what you need for the **`gh` half**,
 because routing `gh` means putting a shim ahead of it on PATH, and no package install should
 do that to you silently. Run it unless you have no use for `gh`.
@@ -93,12 +93,17 @@ sshid doctor        # exits non-zero when something is actually wrong
 
 ## Adding an identity
 
+
 ```sh
-sshid add example                       # ed25519 by default; --type=rsa or ecdsa too
-sshid add example --show-key | pbcopy   # register the public key on the account
-sshid route example --org github.com:example-org \
-                    --proof git@github.com:example-org/some-repo.git
+sshid create example                  # make the key. Nothing is bound to it yet.
+sshid pubkey example | pbcopy         # register the public key on the account
+sshid bind example --org github.com:example-org \
+                   --proof git@github.com:example-org/some-repo.git
+sshid bind example --dir ~/code/example      # optional: also bind a folder
 ```
+
+The key has to exist before anything can be bound to it, so `create` comes first. Binding a
+**folder** contacts nothing. Binding an **organisation** requires `--proof`.
 
 The `--proof` is not ceremony. An SSH key can authenticate perfectly and still be denied
 every repository on an account, and when that happens git reports `repository not found` —
@@ -109,9 +114,10 @@ an organisation until it has watched the key actually reach a real repository th
 
 Every change is snapshotted first, and `sshid undo` restores the last one.
 
-`sshid unbind` stops routing an identity but keeps the key. `sshid forget` removes the
-identity and still keeps the key, because an unrouted key costs nothing and deleting one
-cannot be undone — `--delete-key` does that, and asks you to type the name to confirm.
+`sshid unbind <name> --all` removes every binding but keeps the key; `--org` or `--dir`
+removes just one. `sshid forget` removes the identity and *still* keeps the key, because an
+unbound key costs nothing and deleting one cannot be undone — `--delete-key` does that, and
+asks you to type the name back to confirm.
 
 `sshid` only rewrites the block it owns, between two markers in `~/.gitconfig`. Everything
 else in that file is read, never written. `adopt` is the one exception, since it has to
