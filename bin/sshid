@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.0"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.1"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
