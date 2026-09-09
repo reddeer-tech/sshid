@@ -1,0 +1,44 @@
+{
+  "name": "ssh-persona",
+  "version": "1.0.0",
+  "description": "Route SSH keys and gh accounts per repository on macOS \u2014 the right identity per project, chosen by git itself, with nothing global to switch. Installs the `sshid` command.",
+  "keywords": [
+    "ssh",
+    "git",
+    "github",
+    "gitlab",
+    "gh",
+    "cli",
+    "macos",
+    "identity",
+    "accounts",
+    "includeif"
+  ],
+  "license": "MIT",
+  "author": "RedDeer",
+  "homepage": "https://github.com/reddeer-tech/sshid#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reddeer-tech/sshid.git"
+  },
+  "bugs": {
+    "url": "https://github.com/reddeer-tech/sshid/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "sshid": "bin/sshid"
+  },
+  "files": [
+    "bin/",
+    "libexec/",
+    "templates/",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -1,0 +1,13 @@
+# sshid manifest — the source of truth for the managed block in ~/.gitconfig.
+# TAB separated. Edit with `sshid`, not by hand.
+#
+#   identity  <name>  <keyfile>  <github-account>  <gitlab-account>
+#   baseline  <name>                     every repo no rule matches uses this key
+#   rule  dir  <name>  <path>            layer 1: this folder is this client
+#   rule  org  <name>  <host>  <org>     layer 2: this org is this client (wins)
+#   alias <name>  <host>  <alias>        a ~/.ssh/config Host entry for probing
+#   ghid  <name>  <gh-account>           gh fallback when the org is unmapped
+#   ghorg <org>   <gh-account>           gh by org — consulted FIRST
+#
+# Order matters and sshid maintains it for you: the baseline sits above every rule,
+# and layer 2 below layer 1, because precedence is positional and last match wins.

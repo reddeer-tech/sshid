@@ -1,0 +1,139 @@
+#!/bin/bash
+# sshid — per-repository gh account routing.
+# Installed by `sshid setup` as ~/.local/bin/gh, AHEAD of the real gh on PATH.
+#
+# WE DO NOT BUNDLE gh. This finds whatever gh you already have and execs it, after
+# exporting GH_TOKEN for THIS ONE CALL. Nothing global is mutated: ~/.config/gh/hosts.yml
+# is never written, the "active account" never moves, and parallel shells in different
+# clients cannot fight. No re-login is needed either — the token comes from the keyring
+# gh already populated.
+# Docs: https://github.com/reddeer-tech/sshid
+
+_gs="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_gs" ]; do _t="$(readlink "$_gs")"; case "$_t" in /*) _gs="$_t" ;; *) _gs="$(dirname "$_gs")/$_t" ;; esac; done
+_gd="$(cd "$(dirname "$_gs")" 2>/dev/null && pwd)"
+self="$_gd/$(basename "$_gs")"
+for _c in "${SSHID_LIB:-}/resolve.sh" "$_gd/resolve.sh" "$_gd/../libexec/resolve.sh" \
+          "$HOME/.config/sshid/resolve.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { RESOLVE="$_c"; break; }
+done
+RESOLVE="${RESOLVE:-$HOME/.config/sshid/resolve.sh}"
+
+# ── find the REAL gh ─────────────────────────────────────────────────────────────────
+# ⚠ COMPARE INODES, NOT STRINGS. The previous shim compared "<dir>/gh" as text, so a
+# symlink pointing back at the shim (the documented /usr/local/bin/gh mitigation!) was
+# selected as the "real" gh and the shim exec'd itself without bound. -ef resolves the
+# link and catches it; the header sniff catches a second COPY of the shim on PATH.
+# SSHID_GH_BIN pins the real gh explicitly. Set it to a path that does not exist to say
+# "there is no gh" — PATH alone cannot say that, because of the hardcoded tail below.
+if [ -n "${SSHID_GH_BIN+x}" ]; then
+  if [ -x "${SSHID_GH_BIN:-}" ]; then exec_real="${SSHID_GH_BIN}"; else exec_real=""; fi
+  real="$exec_real"
+else
+real=""; fallback=""
+IFS=: read -ra _p <<< "$PATH"
+for d in "${_p[@]}" "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin /usr/bin; do
+  [ -n "$d" ] && [ -x "$d/gh" ] || continue
+  cand=$(cd "$d" 2>/dev/null && pwd)/gh
+  [ -e "$cand" ] && [ "$cand" -ef "$self" ] && continue
+  if [ "$(head -c 2 "$cand" 2>/dev/null)" = "#!" ]; then
+    # A script. It may be another routing wrapper (the shim this replaced said
+    # "gh identity routing shim", which no header sniff of ours would have caught) or a
+    # legitimate local wrapper. Remember the first one, but keep looking for the binary.
+    head -c 400 "$cand" 2>/dev/null | grep -qi 'gh.*routing\|routing.*gh' && continue
+    [ -z "$fallback" ] && fallback="$cand"
+    continue
+  fi
+  real="$cand"; break
+done
+# Only if there is no compiled gh anywhere.
+[ -z "$real" ] && real="$fallback"
+fi
+# NO gh INSTALLED IS NOT AN ERROR WE CAUSE. Say so once, plainly, and exit the way a
+# missing command exits — never hang, never pretend to be gh.
+if [ -z "$real" ]; then
+  printf 'gh: not installed (sshid routes gh but does not bundle it).\n' >&2
+  printf '    install it:  brew install gh    then:  sshid doctor\n' >&2
+  exit 127
+fi
+
+# ── 1. an explicit token always wins ─────────────────────────────────────────────────
+[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && exec "$real" "$@"
+
+# ── 2. refuse the one command that breaks every other project at once ────────────────
+_refuse_switch(){
+  cat >&2 <<MSG
+gh: refusing \`gh auth switch\`.
+  It flips ONE global account for every project on this machine at once, and has already
+  caused real damage here. sshid routes per repository, so you do not need it:
+      sshid whoami            what account applies here, and why
+      gh -R owner/repo ...    routed by that org, from anywhere
+  Really need it (changes global state):  GH_ALLOW_AUTH_SWITCH=1 gh auth switch ...
+MSG
+  exit 2
+}
+[ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ] && [ -z "${GH_ALLOW_AUTH_SWITCH:-}" ] && _refuse_switch
+# ⚠ AND CLOSE THE ALIAS DOOR. gh expands aliases INSIDE the real binary, after we exec,
+# so `gh <alias>` where the alias expands to `auth switch` walks straight past the test
+# above. Refuse creating such an alias, and refuse invoking one that already exists.
+if [ "${1:-}" = "alias" ] && [ "${2:-}" = "set" ]; then
+  case " $* " in *" auth switch"*|*"auth switch "*) _refuse_switch ;; esac
+fi
+case "${1:-}" in
+  ""|-*|auth|config|version|help|api|pr|issue|repo|run|release|gist|browse|search|workflow|secret|ssh-key|label|project|codespace|extension|status|completion|alias|attestation|cache|org|ruleset|variable|preview|accessibility)
+    ;;  # a known builtin: cannot be an alias, skip the lookup entirely
+  *)
+    _cfg="${GH_CONFIG_DIR:-$HOME/.config/gh}/config.yml"
+    if [ -f "$_cfg" ]; then
+      _exp=$(awk -v a="${1:-}" '/^aliases:/{i=1;next} i&&/^[^ ]/{i=0} i&&$1==a":"{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_cfg" 2>/dev/null)
+      case "$_exp" in "auth switch"*|*"'auth switch"*) _refuse_switch ;; esac
+    fi ;;
+esac
+
+# ── 3. commands that must see real global state, untouched ───────────────────────────
+case "${1:-}" in
+  auth|config|version|help|--version|--help|"") exec "$real" "$@" ;;
+esac
+
+# ── 4. an explicit -R/--repo routes by THAT org, wherever you are standing ───────────
+acct=""; org=""
+_norm_org(){ local o="$1"; o=${o#*://}; o=${o#git@}; o=${o#github.com}; o=${o#:}; o=${o#/}; printf '%s' "${o%%/*}"; }
+n=$#; i=1
+while [ "$i" -le "$n" ]; do
+  a="${!i}"
+  case "$a" in
+    -R|--repo) j=$((i+1)); [ "$j" -le "$n" ] && org=$(_norm_org "${!j}") ;;
+    # ⚠ THE ATTACHED FORMS TOO. The old shim matched only the exact flag, so `-Rowner/repo`
+    # — a normal way to "pass the flag", and what the docs told people to do — silently
+    # fell through to cwd routing and failed as a permissions error.
+    -R?*)       org=$(_norm_org "${a#-R}") ;;
+    --repo=*)   org=$(_norm_org "${a#--repo=}") ;;
+  esac
+  i=$((i+1))
+done
+if [ -n "$org" ] && [ -f "$RESOLVE" ]; then
+  acct=$(awk -v key="$org" '
+    /^[[:space:]]*#/{next} /^\[.*\]$/{sec=$0;gsub(/^\[|\]$/,"",sec);next}
+    { if (sec=="org" && $1==key) { print $2; exit } }' \
+    "${SSHID_GHMAP:-$HOME/.config/git/identities/gh-accounts.map}" 2>/dev/null)
+fi
+
+# ── 5. otherwise, route by the repo we are standing in ───────────────────────────────
+if [ -z "$acct" ] && [ -x "$RESOLVE" ]; then
+  acct=$("$RESOLVE" "$PWD" 2>/dev/null | cut -f5)
+fi
+[ -z "$acct" ] && exec "$real" "$@"
+
+# ── 6. mapped but not logged in: warn once, then behave exactly like plain gh ─────────
+tok=$("$real" auth token -u "$acct" 2>/dev/null)
+if [ -z "$tok" ]; then
+  mark="${TMPDIR:-/tmp}/.sshid-gh-warn.$PPID.$acct"
+  if [ ! -e "$mark" ]; then
+    : > "$mark" 2>/dev/null
+    printf "gh: '%s' is not logged in — falling back to the active account, which may not see this repo.\n" "$acct" >&2
+    printf "    fix:  gh auth login --hostname github.com   (as %s)\n" "$acct" >&2
+  fi
+  exec "$real" "$@"
+fi
+export GH_TOKEN="$tok"
+exec "$real" "$@"

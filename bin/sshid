@@ -1,0 +1,1122 @@
+#!/bin/bash
+# sshid — route SSH keys and gh accounts per repository (macOS).
+# Selection is a pure function of the repo, resolved by git itself, so there is nothing
+# global to switch and parallel sessions cannot fight. See README.md.
+# set -u catches the real class of bug (an unset variable read as empty).
+# ⚠ NO pipefail, deliberately. This codebase uses `… | grep -q` and `… | head -1` as
+# conditionals throughout, and those consumers exit on the first match — which SIGPIPEs
+# the upstream command, which pipefail then reports as a failed pipeline. Measured: with
+# pipefail on, `man_has` returned false for an identity that was plainly in the manifest,
+# so every command answered "unknown identity". A silently-wrong conditional is far more
+# dangerous here than a missed upstream error.
+set -u
+
+SSHID_VERSION="1.0.0"   # kept in step with package.json by `make version`
+
+# ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
+# Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
+# node_modules, and dirname of the LINK has no libexec beside it — so every candidate
+# below missed and a brew install silently ran the ~/.config copy.
+_s="${BASH_SOURCE[0]:-$0}"
+while [ -L "$_s" ]; do _t="$(readlink "$_s")"; case "$_t" in /*) _s="$_t" ;; *) _s="$(dirname "$_s")/$_t" ;; esac; done
+_d="$(cd "$(dirname "$_s")" 2>/dev/null && pwd)"
+for _c in "${SSHID_LIB:-}" "$_d/../libexec" "$_d/../lib/sshid" "$HOME/.config/sshid"; do
+  [ -n "$_c" ] && [ -f "$_c/lib.sh" ] && { SSHID_LIBDIR="$_c"; break; }
+done
+SSHID_LIBDIR="${SSHID_LIBDIR:-$HOME/.config/sshid}"
+[ -f "$SSHID_LIBDIR/lib.sh" ] || { echo "sshid: cannot find lib.sh (looked in $SSHID_LIBDIR)" >&2; exit 127; }
+. "$SSHID_LIBDIR/lib.sh"
+RESOLVE="$SSHID_LIBDIR/resolve.sh"
+ghshim_src(){ local c
+  for c in "$SSHID_LIBDIR/gh-shim" "$SSHID_LIBDIR/shims/gh-shim" \
+           "$SSHID_LIBDIR/../libexec/shims/gh-shim" "$HOME/.config/sshid/gh-shim"; do
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done; return 1; }
+GHSHIM="$(ghshim_src 2>/dev/null || echo "$SSHID_LIBDIR/gh-shim")"
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+# The real gh, never our shim — used for probes so a shim bug cannot hide a gh problem.
+real_gh(){ local d c self="$SSHID_LIBDIR/gh-shim"
+  IFS=: read -ra _p <<< "$PATH"
+  for d in "${_p[@]}" "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+    [ -n "$d" ] && [ -x "$d/gh" ] || continue
+    c=$(cd "$d" 2>/dev/null && pwd)/gh
+  # ⚠ THE REAL gh IS A COMPILED BINARY. Matching a header comment only catches shims we
+  # know about — the previous routing shim on this machine said "gh identity routing shim"
+  # and was picked as "the real gh", so setup chained one wrapper into another. Any
+  # candidate starting with #! is a script and is therefore not the binary we want.
+    [ -e "$c" ] && [ "$c" -ef "$self" ] && continue
+    [ "$(head -c 2 "$c" 2>/dev/null)" = "#!" ] && continue
+    printf '%s\n' "$c"; return 0
+  done; return 1; }
+
+# ── probes ───────────────────────────────────────────────────────────────────────────
+# ⚠ THREE-VALUED, ALWAYS. A probe that fails is NOT "denied". Reporting a locked keychain
+# or a dead network as "this key has no access" is how someone deletes a working identity.
+# ⚠ SETS GLOBALS, DOES NOT PRINT. Called as `acct=$(probe_account ...)` the state
+# assignment happens in the SUBSHELL and is lost, and `set -u` then trips on the read.
+# Same trap claude-account documents for its memoised identities: a function that has to
+# report two things must set both, never print one and set the other.
+PROBE_ACCT=""; PROBE_STATE=""
+probe_account(){ # <keyfile> <host> -> sets PROBE_ACCT and PROBE_STATE
+  local k="$1" h="$2" out
+  PROBE_ACCT=""; PROBE_STATE=error
+  [ -f "$k" ] || { PROBE_STATE=nokey; return 0; }
+  # ⚠ </dev/null IS LOAD-BEARING. ssh reads stdin, so calling this inside a `while read`
+  # loop that is fed from a file makes ssh swallow the REST OF THE FILE and the loop ends
+  # after one iteration. Measured on the real machine: adopt recorded 1 of 7 identities.
+  out=$(ssh $SSH_PROBE_OPTS -i "$k" -T "git@$h" </dev/null 2>&1 | head -1)
+  case "$out" in
+    "Hi "*)                  PROBE_STATE=ok; PROBE_ACCT=$(printf '%s' "$out" | sed 's/^Hi //; s/[!,].*//') ;;
+    "Welcome to GitLab, @"*) PROBE_STATE=ok; PROBE_ACCT=$(printf '%s' "$out" | sed 's/^Welcome to GitLab, @//; s/!.*//') ;;
+    *"Permission denied"*)   PROBE_STATE=denied ;;
+    *)                       PROBE_STATE=error ;;
+  esac
+  return 0
+}
+
+# ── INSPECT ──────────────────────────────────────────────────────────────────────────
+cmd_list(){
+  case " $* " in *" --json "*) cmd_list_json; return $? ;; esac
+  local probe=0 count=1 rules=1
+  case " $* " in *" --probe "*) probe=1 ;; esac
+  case " $* " in *" --no-count "*) count=0 ;; esac
+  # The RULES column says how many; on its own that is not much use. What you actually
+  # want to know is WHICH folders and orgs a key is bound to, so show them by default.
+  case " $* " in *" --brief "*) rules=0 ;; esac
+  man_init
+  local -a names=(); local n
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(man_names)
+  if [ "${#names[@]}" = 0 ]; then
+    yel "no identities yet."
+    dim "  sshid adopt        import the routing already on this machine"
+    dim "  sshid add <name>   create a new identity"
+    return 0
+  fi
+  # One pass over the estate, tallying by identity — 152 git calls, not 152 per row.
+  # ⚠ NO ASSOCIATIVE ARRAY. macOS ships bash 3.2.57 and the shebang is /bin/bash, so
+  # `local -A` is a syntax error on every machine this ships to. Count with sort|uniq.
+  local tally=""
+  if [ "$count" = 1 ]; then
+    local r id
+    tally=$(while IFS= read -r r; do [ -n "$r" ] || continue
+      id=$(ident_from_cmd "$(git -C "$r" config core.sshCommand 2>/dev/null)")
+      [ -n "$id" ] && printf '%s\n' "$id"
+    done < <(repos) | sort | uniq -c)
+  fi
+  local base; base=$(man_baseline)
+  printf '\n  %s%s%s%s%s\n' "$(cell 22 IDENTITY)" "$(cell 20 GITHUB)" "$(cell 16 GITLAB)" "$(cell 7 RULES)" "REPOS"
+  printf '  '; printf '─%.0s' $(seq 1 74); echo
+  local rec gh gl nrules cnt tag
+  for n in "${names[@]}"; do
+    rec=$(man_get identity | awk -F'\t' -v n="$n" '$1==n{print;exit}')
+    gh=$(man_field "$rec" 3); gl=$(man_field "$rec" 4)
+    if [ "$probe" = 1 ]; then
+      local k; k=$(keyfile_for "$n")
+      probe_account "$k" github.com; gh="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gh="($PROBE_STATE)"
+      probe_account "$k" gitlab.com; gl="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gl="($PROBE_STATE)"
+    fi
+    nrules=$(( $(man_rules dir | awk -F'\t' -v n="$n" '$1==n' | grep -c .) + $(man_rules org | awk -F'\t' -v n="$n" '$1==n' | grep -c .) ))
+    cnt=$(printf '%s\n' "$tally" | awk -v x="$n" '$2==x{print $1;exit}'); cnt="${cnt:-0}"
+    [ "$count" = 0 ] && cnt="-"
+    tag=""; [ "$n" = "$base" ] && tag=" (baseline)"
+    printf '  %s%s%s%s%s%s\n' "$(cell 22 "$n" 32)" "$(cell 20 "${gh:--}")" "$(cell 16 "${gl:--}")" "$(cell 7 "$nrules")" "$cnt" "$(dim_inline "$tag")"
+    if [ "$rules" = 1 ]; then
+      local rr
+      while IFS= read -r rr; do [ -n "$rr" ] || continue
+        [ "$(man_field "$rr" 1)" = "$n" ] && dim "      dir  $(printf '%s' "$(man_field "$rr" 2)" | sed "s|$HOME|~|")"
+      done < <(man_rules dir)
+      while IFS= read -r rr; do [ -n "$rr" ] || continue
+        [ "$(man_field "$rr" 1)" = "$n" ] && dim "      org  $(man_field "$rr" 2):$(man_field "$rr" 3)"
+      done < <(man_rules org)
+      [ "$nrules" = 0 ] && dim "      (no rules — this identity can never be selected)"
+    fi
+  done
+  echo
+  [ "$probe" = 0 ] && dim "  accounts as recorded — 'sshid list --probe' re-measures them live"
+  [ "$rules" = 1 ] && dim "  'sshid list --brief' hides the rules; 'sshid whoami' answers for one repo"
+  return 0
+}
+dim_inline(){ [ -z "$1" ] && return 0; if [ "$SSHID_COLOUR" = 1 ]; then printf '\033[2m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+
+cmd_list_json(){
+  man_init
+  { printf '{\n  "version": "%s",\n  "baseline": "%s",\n  "identities": [\n' "$SSHID_VERSION" "$(man_baseline)"
+    local first=1 n rec
+    while IFS= read -r n; do [ -n "$n" ] || continue
+      rec=$(man_get identity | awk -F'\t' -v x="$n" '$1==x{print;exit}')
+      [ "$first" = 0 ] && printf ',\n'; first=0
+      printf '    {"name":"%s","key":"%s","github":"%s","gitlab":"%s"}' \
+        "$n" "$(man_field "$rec" 2)" "$(man_field "$rec" 3)" "$(man_field "$rec" 4)"
+    done < <(man_names)
+    printf '\n  ],\n  "rules": [\n'
+    first=1
+    local r
+    while IFS= read -r r; do [ -n "$r" ] || continue
+      [ "$first" = 0 ] && printf ',\n'; first=0
+      printf '    {"layer":1,"identity":"%s","dir":"%s"}' "$(man_field "$r" 1)" "$(man_field "$r" 2)"
+    done < <(man_rules dir)
+    while IFS= read -r r; do [ -n "$r" ] || continue
+      [ "$first" = 0 ] && printf ',\n'; first=0
+      printf '    {"layer":2,"identity":"%s","host":"%s","org":"%s"}' "$(man_field "$r" 1)" "$(man_field "$r" 2)" "$(man_field "$r" 3)"
+    done < <(man_rules org)
+    printf '\n  ]\n}\n'
+  }
+}
+
+# The inverse of `list`: every repository on disk and which identity it actually uses.
+# `list` answers "what is this key bound to"; this answers "what does this path use", which
+# is the question you have when you are standing in a folder wondering who you will push as.
+cmd_paths(){
+  local want="" a
+  for a in "$@"; do case "$a" in -*) ;; *) want="$a" ;; esac; done
+  [ -n "$want" ] && { man_has "$want" || { red "unknown identity '$want'"; return 1; }; }
+  local r id by why n=0 w=0 list
+  list=$(repos | sort)
+  # Size the column to the data, capped — a fixed 56 made every longer path overflow and
+  # shunt the next column sideways.
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    r=$(printf '%s' "$r" | sed "s|$HOME|~|"); [ "${#r}" -gt "$w" ] && w=${#r}
+  done <<EOF
+$list
+EOF
+  [ "$w" -gt 64 ] && w=64; [ "$w" -lt 20 ] && w=20
+  printf '\n  %s%s%s\n' "$(cell $((w+2)) PATH)" "$(cell 20 IDENTITY)" "MATCHED BY"
+  printf '  '; printf '─%.0s' $(seq 1 $((w+42))); echo
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    id=$(ident_from_cmd "$(git -C "$r" config core.sshCommand 2>/dev/null)")
+    [ -n "$want" ] && [ "$id" != "$want" ] && continue
+    by=$(git -C "$r" config --show-origin core.sshCommand 2>/dev/null | awk '{print $1}')
+    case "$by" in
+      *identities/*) why="a rule" ;;
+      *.git/config)  why="REPO-LOCAL OVERRIDE" ;;
+      *)             why="the baseline (no rule matched)" ;;
+    esac
+    local shown; shown=$(printf '%s' "$r" | sed "s|$HOME|~|")
+    [ "${#shown}" -gt "$w" ] && shown="...${shown: -$((w-3))}"
+    printf '  %s%s%s\n' "$(cell $((w+2)) "$shown")" "$(cell 20 "${id:--}" 32)" "$(dim_inline "$why")"
+    n=$((n+1))
+  done <<EOF
+$list
+EOF
+  echo; dim "  $n repositories${want:+ using '$want'}"
+  [ -z "$want" ] && dim "  'sshid paths <identity>' filters; 'sshid whoami' explains one repo in full"
+  return 0
+}
+
+cmd_whoami(){
+  local dir="" porcelain=0 a
+  for a in "$@"; do case "$a" in --porcelain) porcelain=1 ;; -*) ;; *) dir="$a" ;; esac; done
+  dir="${dir:-$PWD}"
+  local line ident key by why gha ghw
+  line=$("$RESOLVE" "$dir" 2>/dev/null)
+  IFS=$'\t' read -r ident key by why gha ghw <<< "$line"
+  if [ "$porcelain" = 1 ]; then printf '%s\t%s\t%s\t%s\n' "${ident:-}" "${why:-}" "${gha:-}" "${ghw:-}"; return 0; fi
+  if [ -z "$ident" ]; then
+    yel "no ssh identity applies here"
+    dim "  not a git repo, or no rule matched and no baseline is set"
+  else
+    printf '  %s %s' "$(cell 14 'identity')" "$(cell 22 "$ident" 32)"
+    [ "$why" = "baseline" ] && dim_inline "(baseline — no rule matched)" ; [ "$why" = "rule" ] && dim_inline "(matched a rule)"
+    [ "$why" = "repo-local override" ] && { printf '\033[31m%s\033[0m' "(REPO-LOCAL OVERRIDE — beats every central rule)"; }
+    echo
+    printf '  %s %s\n' "$(cell 14 'key')" "${key:--}"
+    printf '  %s %s\n' "$(cell 14 'decided by')" "$(printf '%s' "${by:--}" | sed "s|$HOME|~|")"
+  fi
+  if [ -n "$gha" ]; then
+    local state="not logged in" rg
+    if rg=$(real_gh); then "$rg" auth token -u "$gha" >/dev/null 2>&1 && state="logged in"; fi
+    printf '  %s %s' "$(cell 14 'gh account')" "$(cell 22 "$gha")"
+    if [ "$state" = "logged in" ]; then dim_inline "($ghw)"; else printf '\033[31m%s\033[0m' "NOT LOGGED IN — falls back to the active account"; fi
+    echo
+  fi
+  # A shim that is not on PATH is the difference between routed and silently unrouted.
+  local onpath; onpath=$(command -v gh 2>/dev/null)
+  if [ -n "$onpath" ] && [ -f "$GHSHIM" ] && ! [ "$onpath" -ef "$HOME/.local/bin/gh" ] 2>/dev/null; then
+    if ! head -c 300 "$onpath" 2>/dev/null | grep -q 'sshid — per-repository gh account routing'; then
+      yel "  ⚠ gh routing is BYPASSED in this shell — $onpath is the real gh, not the shim"
+      dim "    fix:  export PATH=\"\$HOME/.local/bin:\$PATH\"     (then: sshid doctor)"
+    fi
+  fi
+  return 0
+}
+
+cmd_verify(){
+  local n="${1:-}" url="${2:-}"
+  [ -n "$n" ] || { echo "usage: sshid verify <name> [repo-url]"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  local k; k=$(keyfile_for "$n")
+  [ -n "$k" ] || { red "no key file in $KEYDIR/$n"; return 1; }
+  echo; echo "1. AUTHENTICATION — which account does this key belong to?"
+  for h in github.com gitlab.com; do
+    probe_account "$k" "$h"
+    case "$PROBE_STATE" in
+      ok)     printf '   %s %s\n' "$(cell 14 "$h" 32)" "$PROBE_ACCT" ;;
+      denied) printf '   %s %s\n' "$(cell 14 "$h")" "no account" ;;
+      *)      printf '   %s %s\n' "$(cell 14 "$h")" "probe failed ($PROBE_STATE) — NOT proof of no access" ;;
+    esac
+  done
+  if [ -z "$url" ]; then
+    echo
+    yel "2. AUTHORIZATION — skipped, no repo url given."
+    dim "   ⚠ A key can authenticate perfectly and still be denied every repo — that is the"
+    dim "     'repository not found' trap. Pass a real url before routing this identity:"
+    dim "       sshid verify $n git@github.com:<org>/<repo>.git"
+    # ⚠ EXIT 1, NOT 0. `verify <name>` with no url must never look like a pass: the whole
+    # point of the rule "never route an unproven key" is that this outcome blocks routing.
+    return 1
+  fi
+  echo; echo "2. AUTHORIZATION — can it actually reach that repo?"
+  local out rc
+  out=$(GIT_SSH_COMMAND="ssh -i $k $SSH_PROBE_OPTS" git ls-remote "$url" HEAD 2>&1); rc=$?
+  if [ $rc = 0 ]; then grn "   OK — $url is reachable with '$n'"; return 0; fi
+  red "   DENIED — do NOT route '$n' to this repo yet."
+  printf '%s\n' "$out" | head -3 | sed 's/^/     /'
+  return 1
+}
+
+cmd_impact(){
+  local n="${1:-}"
+  [ -n "$n" ] || { echo "usage: sshid impact <name>"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  local rec; rec=$(man_get identity | awk -F'\t' -v x="$n" '$1==x{print;exit}')
+  echo; echo "IDENTITY  $n"
+  printf '  key       %s\n' "$(keyfile_for "$n")"
+  printf '  github    %s\n' "$(man_field "$rec" 3)"
+  printf '  gitlab    %s\n' "$(man_field "$rec" 4)"
+  echo; echo "RULES THAT WOULD BE REMOVED"
+  local r any=0
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    [ "$(man_field "$r" 1)" = "$n" ] && { printf '  dir  %s\n' "$(man_field "$r" 2)"; any=1; }
+  done < <(man_rules dir)
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    [ "$(man_field "$r" 1)" = "$n" ] && { printf '  org  %s:%s\n' "$(man_field "$r" 2)" "$(man_field "$r" 3)"; any=1; }
+  done < <(man_rules org)
+  [ "$any" = 0 ] && dim "  (none — this identity is not routed anywhere)"
+  echo; echo "REPOS CURRENTLY USING IT"
+  local c=0 rp
+  while IFS= read -r rp; do [ -n "$rp" ] || continue
+    if [ "$(ident_from_cmd "$(git -C "$rp" config core.sshCommand 2>/dev/null)")" = "$n" ]; then
+      c=$((c+1)); [ "$c" -le 20 ] && printf '  %s\n' "$(printf '%s' "$rp" | sed "s|$HOME|~|")"
+    fi
+  done < <(repos)
+  [ "$c" = 0 ] && dim "  (none)" || { [ "$c" -gt 20 ] && dim "  … and $((c-20)) more"; }
+  echo
+  if [ "$c" -gt 0 ]; then
+    yel "VERDICT: $c repo(s) would fall back to the baseline and start failing with"
+    yel "         'repository not found'. Re-route them first, or use --force."
+  else
+    grn "VERDICT: nothing routes to it — safe to remove."
+  fi
+  return 0
+}
+
+cmd_export(){
+  man_init
+  printf '# sshid export — rules and labels. NO KEYS AND NO TOKENS.\n'
+  local r
+  printf 'baseline\t%s\n' "$(man_baseline)"
+  while IFS= read -r r; do [ -n "$r" ] && printf 'identity\t%s\n' "$r"; done < <(man_get identity)
+  while IFS= read -r r; do [ -n "$r" ] && printf 'rule\tdir\t%s\n' "$r"; done < <(man_rules dir)
+  while IFS= read -r r; do [ -n "$r" ] && printf 'rule\torg\t%s\n' "$r"; done < <(man_rules org)
+  while IFS= read -r r; do [ -n "$r" ] && printf 'alias\t%s\n' "$r"; done < <(man_get alias)
+  while IFS= read -r r; do [ -n "$r" ] && printf 'ghid\t%s\n' "$r"; done < <(man_get ghid)
+  while IFS= read -r r; do [ -n "$r" ] && printf 'ghorg\t%s\n' "$r"; done < <(man_get ghorg)
+}
+
+# ── DOCTOR ───────────────────────────────────────────────────────────────────────────
+# ⚠ prob COUNTS AND THE EXIT CODE MEANS IT. The scripts this replaces always exited 0 and
+# had a warn() that incremented nothing, so "no structural problems found" coexisted with
+# four standing warnings and nothing downstream could ever gate on the result.
+DPROB=0; DWARN=0
+d_ok(){   if [ "$SSHID_COLOUR" = 1 ]; then printf '  \033[32m✓\033[0m %s\n' "$*"; else printf '  ✓ %s\n' "$*"; fi; }
+d_warn(){ if [ "$SSHID_COLOUR" = 1 ]; then printf '  \033[33m!\033[0m %s\n' "$*"; else printf '  ! %s\n' "$*"; fi; DWARN=$((DWARN+1)); }
+d_bad(){  if [ "$SSHID_COLOUR" = 1 ]; then printf '  \033[31m✗\033[0m %s\n' "$*"; else printf '  ✗ %s\n' "$*"; fi; DPROB=$((DPROB+1)); }
+
+cmd_doctor(){
+  man_init
+  local gv
+  echo; echo "environment"
+  gv=$(git --version 2>/dev/null | awk '{print $3}')
+  if [ -n "$gv" ] && [ "$(printf '%s\n2.36.0\n' "$gv" | sort -V | head -1)" = "2.36.0" ]; then
+    d_ok "git $gv (>= 2.36, hasconfig rules are honoured)"
+  else
+    d_bad "git ${gv:-not found} is below 2.36 — EVERY org rule is silently ignored and every repo falls to the baseline"
+  fi
+
+  echo; echo "identities"
+  local n k anyid=0
+  while IFS= read -r n; do [ -n "$n" ] || continue; anyid=1
+    k=$(keyfile_for "$n")
+    if [ -z "$k" ]; then d_bad "$n -> no key in $KEYDIR/$n"
+    elif [ ! -f "$FRAGDIR/$n.gitconfig" ]; then d_bad "$n -> fragment missing: $FRAGDIR/$n.gitconfig"
+    elif ssh-keygen -y -P "" -f "$k" >/dev/null 2>&1; then d_ok "$n -> $(printf '%s' "$k" | sed "s|$HOME|~|") (passphrase-free)"
+    else d_bad "$n key has a PASSPHRASE — routing uses IdentityAgent=none, so it will prompt on every git command"
+    fi
+  done < <(man_names)
+  [ "$anyid" = 0 ] && d_warn "no identities recorded — run 'sshid adopt' or 'sshid add <name>'"
+
+  echo; echo "routing"
+  if [ -f "$GITCONFIG" ] && grep -qF "$GC_BEGIN" "$GITCONFIG"; then d_ok "managed block present in ~/.gitconfig"
+  else d_warn "no sshid managed block in ~/.gitconfig — routing is not installed (run 'sshid adopt')"; fi
+  git config --file "$GITCONFIG" --list >/dev/null 2>&1 && d_ok "~/.gitconfig parses" || d_bad "~/.gitconfig does NOT parse"
+  # An orphan fragment is the mistake the docs call most likely, and the old doctor could
+  # not see it: it walked rules->fragments and never fragments->rules.
+  local f fn used
+  for f in "$FRAGDIR"/*.gitconfig; do [ -f "$f" ] || continue
+    fn=$(basename "$f" .gitconfig)
+    man_has "$fn" || { d_warn "orphan fragment $fn.gitconfig — no identity owns it"; continue; }
+    used=$(( $(man_rules dir | awk -F'\t' -v x="$fn" '$1==x' | grep -c .) + $(man_rules org | awk -F'\t' -v x="$fn" '$1==x' | grep -c .) ))
+    [ "$used" = 0 ] && [ "$fn" != "$(man_baseline)" ] && d_warn "$fn has a key and a fragment but ZERO rules — it can never be selected"
+  done
+
+  echo; echo "repositories"
+  local nrepo=0 nover=0 nbase=0 nssh=0 r id by u listbase=0
+  case " $* " in *" --list-baseline "*) listbase=1 ;; esac
+  local baselist=""
+  while IFS= read -r r; do [ -n "$r" ] || continue; nrepo=$((nrepo+1))
+    [ -n "$(git -C "$r" config --local --get core.sshCommand 2>/dev/null)" ] && { nover=$((nover+1)); d_bad "repo-local core.sshCommand overrides central routing: $(printf '%s' "$r" | sed "s|$HOME|~|")"; }
+    by=$(git -C "$r" config --show-origin core.sshCommand 2>/dev/null | awk '{print $1}')
+    case "$by" in *identities/*) ;; *) if [ -n "$(git -C "$r" config --get-regexp '^remote\..*\.url$' 2>/dev/null | grep 'git@')" ]; then
+        nbase=$((nbase+1)); baselist="$baselist$(printf '%s' "$r" | sed "s|$HOME|~|")
+"; fi ;; esac
+  done < <(repos)
+  d_ok "$nrepo repositories scanned (no depth limit; vendored trees pruned)"
+  [ "$nover" = 0 ] && d_ok "no repo-local core.sshCommand overrides"
+  if [ "$nbase" -gt 0 ]; then
+    d_warn "$nbase repo(s) with an ssh remote fall through to the baseline — 'sshid doctor --list-baseline' to see them"
+    [ "$listbase" = 1 ] && printf '%s' "$baselist" | sed 's/^/      /'
+  fi
+  # ssh:// remotes match no rule: the globs are the scp-like git@host:org/** form.
+  while IFS=$'\t' read -r r u; do [ -n "$r" ] || continue
+    d_warn "ssh:// remote matches NO rule (rules use the git@host:org/ form): $(printf '%s' "$r" | sed "s|$HOME|~|") -> $u"
+  done < <(remotes | awk -F'\t' '$3 ~ /^ssh:\/\// {print $1"\t"$3}')
+
+  echo; echo "gh routing"
+  local rg shim
+  if ! rg=$(real_gh); then
+    d_warn "gh is not installed — gh routing is inactive (sshid does not bundle gh; 'brew install gh')"
+  else
+    d_ok "real gh at $(printf '%s' "$rg" | sed "s|$HOME|~|")"
+    shim=$(command -v gh 2>/dev/null)
+    if [ -n "$shim" ] && head -c 300 "$shim" 2>/dev/null | grep -q 'sshid — per-repository gh account routing'; then
+      d_ok "the shim wins PATH in this shell"
+    elif [ -f "$HOME/.local/bin/gh" ]; then
+      d_bad "the shim is installed but SHADOWED in this shell by $shim — every gh call uses the globally-active account"
+      dim "     fix:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    else
+      d_warn "gh shim not installed — run 'sshid setup'"
+    fi
+    [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && d_bad "GH_TOKEN/GITHUB_TOKEN is set in this environment — it overrides ALL gh routing, silently"
+    local o a
+    while IFS= read -r o; do [ -n "$o" ] || continue
+      a=$(man_field "$o" 2)
+      "$rg" auth token -u "$a" >/dev/null 2>&1 || d_warn "gh account '$a' is not logged in — repos mapped to it fall back to the active account"
+    done < <(man_get ghorg | awk -F'\t' '!seen[$2]++')
+  fi
+  # An org with a remote but no rule silently lands on the baseline and fails later.
+  echo; echo "coverage"
+  local unmapped=""
+  while IFS= read -r u; do [ -n "$u" ] || continue
+    local host org
+    host=$(printf '%s' "$u" | sed -E 's#^(ssh://)?(git@)?([^:/]+)[:/].*#\3#')
+    org=$(printf '%s' "$u" | sed -E 's#^(ssh://)?(git@)?[^:/]+[:/]([^/]+)/.*#\3#')
+    case "$host" in github.com|gitlab.com) ;; *) continue ;; esac
+    man_rules org | awk -F'\t' -v h="$host" -v o="$org" '$2==h && $3==o' | grep -q . || \
+      case " $unmapped " in *" $host:$org "*) ;; *) unmapped="$unmapped $host:$org" ;; esac
+  done < <(remotes | awk -F'\t' '$3 ~ /^(git@|ssh:)/ {print $3}')
+  if [ -z "$unmapped" ]; then d_ok "every ssh org in every remote has a routing rule"
+  else for o in $unmapped; do d_warn "no rule for $o — those repos use the baseline key"; done; fi
+
+  echo
+  if [ "$DPROB" = 0 ] && [ "$DWARN" = 0 ]; then grn "healthy — no problems and no warnings"; return 0
+  elif [ "$DPROB" = 0 ]; then yel "$DWARN warning(s), no failures"; return 0
+  else red "$DPROB problem(s) and $DWARN warning(s)"; return 1; fi
+}
+
+# ── ADOPT ────────────────────────────────────────────────────────────────────────────
+# Import routing that already exists on this machine, then take ownership of it.
+# ⚠ THIS IS THE ONLY COMMAND THAT EDITS OUTSIDE THE MARKERS. It has to: the rules it is
+# adopting are hand-written in the user's own config, and leaving them there alongside a
+# generated copy would double every rule. So it proves the result instead of trusting it:
+# every repo's resolved identity is recorded before and after, and ANY difference rolls
+# the whole thing back.
+man_names_of(){ awk -F'\t' '$1=="identity"{print $2}' "$1" | tr '\n' ' '; }
+snapshot_resolution(){ local r
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    printf '%s\t%s\n' "$r" "$(ident_from_cmd "$(git -C "$r" config core.sshCommand 2>/dev/null)")"
+  done < <(repos) | sort
+}
+
+cmd_adopt(){
+  local probe=1 assume=0 a
+  for a in "$@"; do case "$a" in --no-probe) probe=0 ;; --force) assume=1 ;; esac; done
+  man_init
+  if grep -qF "$GC_BEGIN" "$GITCONFIG" 2>/dev/null && [ "$assume" = 0 ]; then
+    yel "~/.gitconfig already has an sshid managed block — nothing to adopt."
+    dim "  'sshid list' shows what is recorded. Re-import anyway with --force."
+    return 0
+  fi
+  [ -f "$GITCONFIG" ] || { red "no $GITCONFIG to adopt from"; return 1; }
+
+  echo "reading the routing already on this machine…"
+  local parsed; parsed=$(mktemp)
+  python3 - "$GITCONFIG" "$KEYDIR" > "$parsed" <<'PY'
+import re, sys, os
+gc, keydir = sys.argv[1], sys.argv[2]
+txt = open(gc, encoding='utf-8', errors='replace').read().splitlines()
+out, sec, buf = [], None, []
+def flush(sec, buf):
+    if sec is None: return
+    m = re.match(r'includeIf\s+"(.+)"$', sec)
+    path = None
+    for b in buf:
+        pm = re.match(r'\s*path\s*=\s*(.+?)\s*$', b)
+        if pm: path = pm.group(1)
+    if m and path:
+        cond = m.group(1)
+        frag = os.path.basename(path)
+        if not frag.endswith('.gitconfig'): return
+        name = frag[:-len('.gitconfig')]
+        d = re.match(r'gitdir/i?:(.+)$', cond)
+        if d:
+            p = d.group(1).rstrip('/')
+            if p.startswith('~'): p = os.path.expanduser(p)
+            out.append(('rule','dir',name,p)); return
+        h = re.match(r'hasconfig:remote\.\*\.url:git@([^:]+):([^/]+)/\*\*$', cond)
+        if h: out.append(('rule','org',name,h.group(1),h.group(2))); return
+    if sec == 'core':
+        for b in buf:
+            cm = re.match(r'\s*sshCommand\s*=\s*.*?-i\s+(\S+)', b)
+            if cm:
+                kp = os.path.expanduser(cm.group(1))
+                # only ours if the key lives in the key store; the identity name is the
+                # directory the key sits in, whatever that store is called.
+                if os.path.dirname(os.path.dirname(kp)) == os.path.realpath(keydir) or kp.startswith(keydir.rstrip('/') + '/'):
+                    out.append(('baseline', os.path.basename(os.path.dirname(kp))))
+for line in txt:
+    s = re.match(r'\s*\[(.+?)\]\s*$', line)
+    if s:
+        flush(sec, buf); sec, buf = s.group(1), []
+    elif sec is not None:
+        buf.append(line)
+flush(sec, buf)
+for rec in out: print('\t'.join(rec))
+# every key present in the skm store, whether routed or not
+for d in sorted(os.listdir(keydir)) if os.path.isdir(keydir) else []:
+    p = os.path.join(keydir, d)
+    if not os.path.isdir(p): continue
+    keys = [f for f in sorted(os.listdir(p)) if f.startswith('id_') and not f.endswith('.pub')]
+    if keys: print('\t'.join(('key', d, os.path.join(p, keys[0]))))
+PY
+  local nrule; nrule=$(grep -c '^rule' "$parsed"); nrule=${nrule:-0}
+  local nkey;  nkey=$(grep -c '^key'  "$parsed"); nkey=${nkey:-0}
+  echo "  found $nkey key(s) and $nrule routing rule(s)"
+  [ "$nrule" = 0 ] && { yel "  no includeIf rules found — nothing to adopt"; rm -f "$parsed"; return 1; }
+
+  # identities: every key, with its measured accounts
+  man_lock || { rm -f "$parsed"; return 1; }
+  local bkdir; bkdir=$(backup adopt)
+  local tmpman; tmpman=$(mktemp)
+  { printf '# sshid manifest — the source of truth for the managed block in ~/.gitconfig.\n'
+    printf '# TAB separated. Edit with `sshid`, not by hand.\n'; } > "$tmpman"
+  local nm kp gh gl
+  while IFS=$'\t' read -r _t nm kp; do [ "$_t" = key ] || continue
+    gh=""; gl=""
+    if [ "$probe" = 1 ]; then
+      probe_account "$kp" github.com; gh="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gh=""
+      probe_account "$kp" gitlab.com; gl="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gl=""
+      printf '  probed %-20s github=%-18s gitlab=%s\n' "$nm" "${gh:--}" "${gl:--}"
+    fi
+    printf 'identity\t%s\t%s\t%s\t%s\n' "$nm" "$kp" "$gh" "$gl" >> "$tmpman"
+  done < "$parsed"
+  grep '^baseline' "$parsed" | head -1 >> "$tmpman"
+  grep '^rule' "$parsed" >> "$tmpman"
+  # ssh aliases already in ~/.ssh/config
+  if [ -f "$SSHCONFIG" ]; then
+    # ⚠ DEDUPE. Our own managed block also contains `Host github-…` lines, so on a second
+    # adopt every alias was collected twice and ~/.ssh/config grew a duplicate stanza per
+    # run. Measured on the real machine: 20 Host lines where there should have been 12.
+    awk '/^Host (github|gitlab)-/{print $2}' "$SSHCONFIG" | sort -u | while IFS= read -r al; do
+      local hn nn; hn=github.com; case "$al" in gitlab-*) hn=gitlab.com ;; esac
+      nn=${al#github-}; nn=${nn#gitlab-}
+      grep -q "^identity	$nn	" "$tmpman" || continue
+      grep -q "^alias	$nn	$hn	$al\$" "$tmpman" || printf 'alias\t%s\t%s\t%s\n' "$nn" "$hn" "$al" >> "$tmpman"
+    done
+  fi
+  # gh map
+  if [ -f "$GHMAP" ]; then
+    awk '/^[[:space:]]*#/{next} /^\[.*\]$/{s=$0;gsub(/^\[|\]$/,"",s);next}
+         NF>=2 { if(s=="identity") print "ghid\t"$1"\t"$2; else if(s=="org") print "ghorg\t"$1"\t"$2 }' "$GHMAP" >> "$tmpman"
+  fi
+  rm -f "$parsed"
+
+  echo "recording what every repo resolves to right now…"
+  local before after; before=$(mktemp); after=$(mktemp)
+  snapshot_resolution > "$before"
+  echo "  $(wc -l < "$before" | tr -d ' ') repositories"
+
+  # Strip the hand-written rules, then install the generated block in their place.
+  local stripped; stripped=$(mktemp)
+  python3 - "$GITCONFIG" "$KEYDIR" > "$stripped" <<'PY'
+import re, sys, os
+lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+keydir = os.path.expanduser(sys.argv[2]).rstrip('/')
+def ours(line):
+    m = re.match(r'\s*sshCommand\s*=\s*.*?-i\s+(\S+)', line)
+    return bool(m) and os.path.expanduser(m.group(1)).startswith(keydir + '/')
+out, i = [], 0
+while i < len(lines):
+    m = re.match(r'\s*\[(.+?)\]\s*$', lines[i])
+    if m:
+        sec, body, j = m.group(1), [], i+1
+        while j < len(lines) and not re.match(r'\s*\[(.+?)\]\s*$', lines[j]):
+            body.append(lines[j]); j += 1
+        drop = False
+        if sec.startswith('includeIf ') and any(re.match(r'\s*path\s*=\s*.*identities/.*\.gitconfig\s*$', b) for b in body):
+            drop = True
+        elif sec == 'core':
+            keep = [b for b in body if not ours(b)]
+            # A [core] that held ONLY the baseline goes entirely; one with other settings
+            # keeps them and loses just the sshCommand line.
+            if len(keep) != len(body):
+                if any(b.strip() and not b.strip().startswith('#') for b in keep):
+                    out.append(lines[i]); out.extend(keep)
+                i = j; continue
+        if drop:
+            # also drop a comment block immediately above it
+            while out and out[-1].strip().startswith('#'): out.pop()
+            while out and not out[-1].strip(): out.pop()
+            i = j; continue
+        out.append(lines[i]); out.extend(body); i = j; continue
+    out.append(lines[i]); i += 1
+while out and not out[-1].strip(): out.pop()
+print('\n'.join(out))
+PY
+  # The same treatment for ~/.ssh/config: hand-written `Host github-<id>` stanzas must be
+  # removed, or they sit alongside the generated block as duplicates forever.
+  if [ -f "$SSHCONFIG" ]; then
+    local sstrip; sstrip=$(mktemp)
+    python3 - "$SSHCONFIG" "$(man_names_of "$tmpman")" > "$sstrip" <<'PYS'
+import re, sys
+lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+names = set(sys.argv[2].split())
+out, i, inblock = [], 0, False
+while i < len(lines):
+    L = lines[i]
+    if L.startswith('# >>> sshid managed aliases'): inblock = True; i += 1; continue
+    if L.startswith('# <<< sshid managed aliases'): inblock = False; i += 1; continue
+    if inblock: i += 1; continue
+    m = re.match(r'Host\s+((?:github|gitlab)-(\S+))\s*$', L)
+    if m and m.group(2) in names:
+        i += 1
+        while i < len(lines) and not re.match(r'Host\s', lines[i]): i += 1
+        while out and not out[-1].strip(): out.pop()
+        continue
+    out.append(L); i += 1
+while out and not out[-1].strip(): out.pop()
+print('\n'.join(out))
+PYS
+    if [ -s "$sstrip" ]; then cp "$sstrip" "$SSHCONFIG"; fi
+    rm -f "$sstrip"
+  fi
+  # ⚠ PROVE THE STRIP BEFORE INSTALLING IT. This is the only place sshid rewrites the
+  # user's own config wholesale. Every setting that is not a routing rule must survive, so
+  # compare the two configs key by key. A crashed parser once produced an empty file here
+  # and it was copied straight over ~/.gitconfig.
+  if [ ! -s "$stripped" ] || ! git config --file "$stripped" --list >/dev/null 2>&1; then
+    red "refusing to adopt: could not rewrite ~/.gitconfig safely (nothing was changed)"
+    rm -f "$stripped" "$before" "$after"; man_unlock; return 1
+  fi
+  local lost
+  lost=$(comm -23 \
+    <(git config --file "$GITCONFIG" --list 2>/dev/null | grep -v '^includeif\.' | grep -v '^core\.sshcommand=' | sort -u) \
+    <(git config --file "$stripped"  --list 2>/dev/null | grep -v '^includeif\.' | grep -v '^core\.sshcommand=' | sort -u))
+  if [ -n "$lost" ]; then
+    red "refusing to adopt: the rewrite would drop settings that are not routing rules:"
+    printf '%s\n' "$lost" | head -10 | sed 's/^/    /'
+    rm -f "$stripped" "$before" "$after"; man_unlock; return 1
+  fi
+  # Install: manifest first, then generate from it onto the stripped config.
+  mv -f "$tmpman" "$MANIFEST"; chmod 0600 "$MANIFEST"
+  local saved="$bkdir/gitconfig"
+  cp "$stripped" "$GITCONFIG"
+  if ! apply_all; then
+    red "apply failed — restoring ~/.gitconfig"
+    cp "$saved" "$GITCONFIG"; man_unlock; rm -f "$before" "$after" "$stripped"; return 1
+  fi
+  rm -f "$stripped"
+
+  echo "verifying every repository resolves to exactly what it did before…"
+  snapshot_resolution > "$after"
+  if ! diff -q "$before" "$after" >/dev/null 2>&1; then
+    red "ROLLING BACK — adoption changed how these repositories resolve:"
+    diff "$before" "$after" | head -20 | sed 's/^/    /'
+    cp "$saved" "$GITCONFIG"
+    [ -f "$bkdir/identities.map" ] && cp "$bkdir/identities.map" "$MANIFEST" || rm -f "$MANIFEST"
+    [ -d "$bkdir/identities" ] && cp "$bkdir/identities"/*.gitconfig "$FRAGDIR/" 2>/dev/null
+    man_unlock; rm -f "$before" "$after"
+    red "~/.gitconfig restored from $bkdir. Nothing was changed."
+    return 1
+  fi
+  man_unlock
+  grn "adopted: $(wc -l < "$after" | tr -d ' ') repositories resolve identically, now managed by sshid"
+  dim "  backup: $(printf '%s' "$bkdir" | sed "s|$HOME|~|")"
+  dim "  next:   sshid list     sshid doctor"
+  rm -f "$before" "$after"
+  return 0
+}
+
+# ── ADD / ROUTE ──────────────────────────────────────────────────────────────────────
+cmd_add(){
+  local n="${1:-}"; shift 2>/dev/null || true
+  local type=ed25519 adopt_key=0 showkey=0 a
+  for a in "$@"; do case "$a" in --type=*) type="${a#--type=}" ;; --existing-key) adopt_key=1 ;; --show-key) showkey=1 ;; esac; done
+  # --show-key prints ONLY the public key, so it can be piped straight to pbcopy.
+  if [ "$showkey" = 1 ]; then
+    local kk; kk=$(keyfile_for "$n")
+    [ -n "$kk" ] && [ -f "$kk.pub" ] || { red "no key for '$n'"; return 1; }
+    cat "$kk.pub"; return 0
+  fi
+  [ -n "$n" ] || { echo "usage: sshid add <name> [--type=ed25519|rsa] [--existing-key]"; return 2; }
+  valid_name "$n" || { red "invalid name '$n' — lowercase letters, digits, . _ - ; must start alphanumeric; max 39"; return 2; }
+  reserved_name "$n" && { red "'$n' is a reserved word"; return 2; }
+  man_has "$n" && { red "identity '$n' already exists"; dim "  sshid impact $n     to see what uses it"; return 1; }
+  local kdir="$KEYDIR/$n" k
+  k=$(keyfile_for "$n")
+  if [ -n "$k" ] && [ "$adopt_key" = 0 ]; then
+    # ⚠ NEVER ssh-keygen OVER AN EXISTING KEY. It destroys access to whatever that key
+    # authorises, irreversibly, with no undo. This is the one refusal with no --force.
+    red "a key already exists at $(printf '%s' "$k" | sed "s|$HOME|~|")"
+    dim "  ssh-keygen would overwrite it and destroy access to whatever it authorises."
+    dim "  to record that existing key as an identity instead:  sshid add $n --existing-key"
+    return 1
+  fi
+  man_lock || return 1
+  backup "add-$n" >/dev/null
+  if [ "$adopt_key" = 1 ]; then
+    [ -n "$k" ] || { red "no key at $kdir to adopt"; man_unlock; return 1; }
+  else
+    mkdir -p "$kdir"; chmod 0700 "$kdir"
+    # Empty passphrase is REQUIRED, not lazy: routing uses IdentityAgent=none, so there is
+    # no agent to cache one and a passphrase means a prompt on every single git command.
+    ssh-keygen -q -t "$type" -N '' -C "$n" -f "$kdir/id_$type" </dev/null || { red "ssh-keygen failed"; man_unlock; return 1; }
+    k="$kdir/id_$type"
+    grn "created $(printf '%s' "$k" | sed "s|$HOME|~|") (no passphrase)"
+  fi
+  local gh gl
+  probe_account "$k" github.com; gh="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gh=""
+  probe_account "$k" gitlab.com; gl="$PROBE_ACCT"; [ "$PROBE_STATE" = ok ] || gl=""
+  man_add "$(printf 'identity\t%s\t%s\t%s\t%s' "$n" "$k" "$gh" "$gl")"
+  apply_all || { red "failed to write config"; man_unlock; return 1; }
+  man_unlock
+  echo
+  if [ -z "$gh$gl" ]; then
+    yel "the key is not registered with any account yet. Register the public key:"
+    echo
+    sed 's/^/    /' "$k.pub"
+    echo
+    dim "    pbcopy < $(printf '%s' "$k.pub" | sed "s|$HOME|~|")     then paste into Settings -> SSH keys"
+    echo
+    dim "  then prove it can reach a real repo, and route it:"
+    dim "    sshid verify $n git@github.com:<org>/<repo>.git"
+    dim "    sshid route $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
+  else
+    grn "identity '$n' recorded  (github: ${gh:--}  gitlab: ${gl:--})"
+    dim "  route it:  sshid route $n --org github.com:<org> --proof git@github.com:<org>/<repo>.git"
+  fi
+  return 0
+}
+
+cmd_route(){
+  local n="${1:-}"; shift 2>/dev/null || true
+  local org="" dir="" proof="" force=0 a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org)   org="${2:-}"; shift 2 ;;   --org=*)   org="${1#--org=}"; shift ;;
+      --dir)   dir="${2:-}"; shift 2 ;;   --dir=*)   dir="${1#--dir=}"; shift ;;
+      --proof) proof="${2:-}"; shift 2 ;; --proof=*) proof="${1#--proof=}"; shift ;;
+      --force) force=1; shift ;;
+      *) red "unknown flag '$1'"; return 2 ;;
+    esac
+  done
+  [ -n "$n" ] || { echo "usage: sshid route <name> [--org host:org] [--dir path] --proof <repo-url>"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  [ -n "$org$dir" ] || { echo "nothing to route: pass --org host:org and/or --dir path"; return 2; }
+  # RULE: never route a key that has not been PROVEN to reach the repos. ssh -T only
+  # proves authentication; a key can authenticate perfectly and be denied every repo.
+  if [ -n "$org" ]; then
+    if [ -n "$proof" ]; then
+      cmd_verify "$n" "$proof" || { red "not routing '$n' — the proof failed"; return 1; }
+    elif [ "$force" = 0 ]; then
+      red "refusing to route an org without proof that '$n' can reach it."
+      dim "  a key can authenticate fine and still be denied every repo — that is the"
+      dim "  'repository not found' trap this tool exists to prevent."
+      dim "    sshid route $n --org $org --proof git@${org%%:*}:${org#*:}/<repo>.git"
+      dim "  or, if you accept the risk:  --force"
+      return 1
+    else
+      yel "routing '$n' to $org WITHOUT proof (--force)"
+    fi
+  fi
+  man_lock || return 1
+  backup "route-$n" >/dev/null
+  [ -n "$dir" ] && { dir="${dir%/}"; case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac
+    man_del "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"
+    man_add "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"; }
+  [ -n "$org" ] && { local h o; h="${org%%:*}"; o="${org#*:}"
+    [ "$h" = "$o" ] && { h=github.com; o="$org"; }
+    man_del "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"
+    man_add "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"
+    # gh routes on the org too, and org is consulted before identity — so an org rule
+    # with no gh mapping silently sends gh to the personal account.
+    local ghacct; ghacct=$(man_get identity | awk -F'\t' -v x="$n" '$1==x{print $3;exit}')
+    [ -n "$ghacct" ] && [ "$h" = github.com ] && {
+      man_del "$(printf 'ghorg\t%s' "$o")"; man_add "$(printf 'ghorg\t%s\t%s' "$o" "$ghacct")"; }; }
+  apply_all || { red "failed to write config"; man_unlock; return 1; }
+  man_unlock
+  grn "routed '$n'"; [ -n "$dir" ] && dim "  dir  $dir"; [ -n "$org" ] && dim "  org  $org"
+  dim "  check:  sshid whoami <a repo in that org>"
+  return 0
+}
+
+cmd_unroute(){
+  local n="${1:-}"; shift 2>/dev/null || true
+  local org="" dir=""
+  while [ $# -gt 0 ]; do case "$1" in
+      --org) org="${2:-}"; shift 2 ;; --org=*) org="${1#--org=}"; shift ;;
+      --dir) dir="${2:-}"; shift 2 ;; --dir=*) dir="${1#--dir=}"; shift ;;
+      *) red "unknown flag '$1'"; return 2 ;; esac; done
+  [ -n "$n" ] || { echo "usage: sshid unroute <name> [--org host:org] [--dir path]"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  man_lock || return 1; backup "unroute-$n" >/dev/null
+  [ -n "$dir" ] && { dir="${dir%/}"; case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac; man_del "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"; }
+  [ -n "$org" ] && { local h o; h="${org%%:*}"; o="${org#*:}"; [ "$h" = "$o" ] && { h=github.com; o="$org"; }
+    man_del "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"; }
+  apply_all || { man_unlock; return 1; }
+  man_unlock; grn "unrouted"; return 0
+}
+
+cmd_unbind(){
+  local n="${1:-}"
+  [ -n "$n" ] || { echo "usage: sshid unbind <name>"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  cmd_impact "$n"
+  man_lock || return 1; backup "unbind-$n" >/dev/null
+  man_del "$(printf 'rule\tdir\t%s' "$n")"; man_del "$(printf 'rule\torg\t%s' "$n")"
+  apply_all || { man_unlock; return 1; }
+  man_unlock
+  grn "'$n' is no longer routed. The key and the identity record are untouched."
+  dim "  to delete the identity as well:  sshid forget $n"
+  return 0
+}
+
+cmd_forget(){
+  local n="${1:-}" force=0 delkey=0 yes=0 a
+  shift 2>/dev/null || true
+  for a in "$@"; do case "$a" in --force) force=1 ;; --delete-key) delkey=1 ;; --yes) yes=1 ;; esac; done
+  [ -n "$n" ] || { echo "usage: sshid forget <name> [--force] [--delete-key]"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  local used=0 r
+  while IFS= read -r r; do [ -n "$r" ] || continue
+    [ "$(ident_from_cmd "$(git -C "$r" config core.sshCommand 2>/dev/null)")" = "$n" ] && used=$((used+1))
+  done < <(repos)
+  if [ "$used" -gt 0 ] && [ "$force" = 0 ]; then
+    cmd_impact "$n"; red "refusing: $used repo(s) still use '$n'. Re-route them, or pass --force."; return 1
+  fi
+  man_lock || return 1; local bk; bk=$(backup "forget-$n")
+  man_del "$(printf 'rule\tdir\t%s' "$n")"; man_del "$(printf 'rule\torg\t%s' "$n")"
+  man_del "$(printf 'identity\t%s' "$n")"; man_del "$(printf 'alias\t%s' "$n")"; man_del "$(printf 'ghid\t%s' "$n")"
+  rm -f "$FRAGDIR/$n.gitconfig"
+  apply_all || { man_unlock; return 1; }
+  man_unlock
+  grn "forgot identity '$n'  (backup: $(printf '%s' "$bk" | sed "s|$HOME|~|"))"
+  if [ "$delkey" = 1 ]; then
+    # ⚠ IRREVERSIBLE, AND NOT ONLY HERE. The key store may be synced, so this can remove
+    # the key from other machines too, and no backup in this tool contains key material —
+    # only fingerprints. So it asks for the name typed back, the way a repo deletion does.
+    local ans=""
+    if [ "$yes" = 1 ]; then ans="$n"
+    elif [ -t 0 ]; then
+      red "  about to PERMANENTLY delete the private key at $KEYDIR/$n"
+      dim "    no backup here contains key material, and the key store may sync elsewhere."
+      printf '    type the identity name to confirm: '; IFS= read -r ans
+    else
+      yel "  the key was kept: deleting it needs a terminal, or --yes."
+      dim "    sshid forget $n --delete-key --yes"
+      ans=""
+    fi
+    if [ "$ans" = "$n" ]; then
+      rm -rf "${KEYDIR:?}/${n:?}" && grn "  deleted the private key at $KEYDIR/$n"
+    else
+      [ -n "$ans" ] && yel "  name did not match — the key was kept."
+    fi
+  else
+    dim "  the key at $KEYDIR/$n was kept — an unrouted key costs nothing."
+  fi
+  dim "  remember to remove the public key from the GitHub/GitLab account too."
+  return 0
+}
+
+cmd_alias(){
+  local n="${1:-}" host="${2:-}"
+  [ -n "$n" ] || { echo "usage: sshid alias <name> [github.com|gitlab.com]"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  man_lock || return 1; backup "alias-$n" >/dev/null
+  local k h pfx; k=$(keyfile_for "$n")
+  for h in ${host:-github.com gitlab.com}; do
+    # Only make an alias for a host the key actually authenticates to — an alias that
+    # answers "no account" is worse than no alias, because it looks like a real check.
+    probe_account "$k" "$h"
+    [ "$PROBE_STATE" = ok ] || { dim "  $h: no account for '$n' — no alias made"; continue; }
+    pfx=${h%%.*}
+    man_del "$(printf 'alias\t%s\t%s' "$n" "$h")"
+    man_add "$(printf 'alias\t%s\t%s\t%s-%s' "$n" "$h" "$pfx" "$n")"
+    grn "  $pfx-$n -> $PROBE_ACCT"
+  done
+  apply_all || { man_unlock; return 1; }
+  man_unlock; return 0
+}
+
+# ── gh ───────────────────────────────────────────────────────────────────────────────
+cmd_gh(){
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)
+      man_init; local rg
+      echo; echo "gh accounts this machine knows about"
+      if rg=$(real_gh); then
+        "$rg" auth status 2>&1 | sed -n 's/.*account \([A-Za-z0-9._-]*\).*/  \1/p' | sort -u
+      else yel "  gh is not installed"; fi
+      echo; echo "org -> account"
+      man_get ghorg | while IFS= read -r r; do [ -n "$r" ] && printf '  %s%s\n' "$(cell 26 "$(man_field "$r" 1)")" "$(man_field "$r" 2)"; done
+      echo; echo "ssh identity -> account (fallback when the org is unmapped)"
+      man_get ghid | while IFS= read -r r; do [ -n "$r" ] && printf '  %s%s\n' "$(cell 26 "$(man_field "$r" 1)")" "$(man_field "$r" 2)"; done
+      echo; return 0 ;;
+    map)
+      local o="${1:-}" acct="${2:-}"
+      [ -n "$o" ] && [ -n "$acct" ] || { echo "usage: sshid gh map <org> <account>"; return 2; }
+      man_lock || return 1; backup "gh-map-$o" >/dev/null
+      man_del "$(printf 'ghorg\t%s' "$o")"; man_add "$(printf 'ghorg\t%s\t%s' "$o" "$acct")"
+      write_ghmap; man_unlock; grn "gh: $o -> $acct"; return 0 ;;
+    unmap)
+      local o="${1:-}"; [ -n "$o" ] || { echo "usage: sshid gh unmap <org>"; return 2; }
+      man_lock || return 1; backup "gh-unmap-$o" >/dev/null
+      man_del "$(printf 'ghorg\t%s' "$o")"; write_ghmap; man_unlock; grn "gh: $o unmapped"; return 0 ;;
+    login)
+      local rg; rg=$(real_gh) || { red "gh is not installed"; return 127; }
+      [ -t 0 ] || { yel "gh login needs your own terminal. Run:"; echo "  gh auth login --hostname github.com"; return 3; }
+      "$rg" auth login --hostname github.com; return $? ;;
+    *) red "unknown: sshid gh $sub"; echo "  try: list | map | unmap | login"; return 2 ;;
+  esac
+}
+
+# ── SETUP / UNDO / IMPORT ────────────────────────────────────────────────────────────
+cmd_setup(){
+  local lib="$HOME/.config/sshid" bindir="${BINDIR:-$HOME/.local/bin}"
+  mkdir -p "$lib" "$bindir" "$BK"
+  # `make install` may already have put these here, in which case src and dest are the
+  # same file and install(1) errors — noise that reads like a failure.
+  _cp(){ [ -f "$1" ] || { d_bad "missing from this install: $1"; return 1; }
+         [ "$1" -ef "$2" ] 2>/dev/null && return 0
+         install -m "$3" "$1" "$2" || { d_bad "could not install $2"; return 1; }; }
+  _cp "$SSHID_LIBDIR/lib.sh"     "$lib/lib.sh"     0644 || return 1
+  _cp "$SSHID_LIBDIR/resolve.sh" "$lib/resolve.sh" 0755 || return 1
+  local gsrc; gsrc=$(ghshim_src) || { d_bad "gh-shim is missing from this install"; return 1; }
+  _cp "$gsrc" "$lib/gh-shim" 0755 || return 1
+  d_ok "resolver installed -> $(printf '%s' "$lib" | sed "s|$HOME|~|")"
+  man_init
+  local rg
+  if ! rg=$(real_gh); then
+    # NOT AN ERROR. We route gh; we do not ship it. Say so and carry on.
+    d_warn "gh is not installed — skipping the gh shim entirely."
+    dim "     nothing is broken; ssh routing works without it."
+    dim "     if you want gh routing:  brew install gh  &&  sshid setup"
+  else
+    if [ -f "$bindir/gh" ] && ! head -c 300 "$bindir/gh" 2>/dev/null | grep -q 'sshid — per-repository gh account routing'; then
+      cp "$bindir/gh" "$BK/gh.$(date +%Y%m%d-%H%M%S).bak"
+      d_ok "backed up the existing $bindir/gh"
+    fi
+    if install -m 0755 "$gsrc" "$bindir/gh"; then
+      d_ok "gh shim installed -> $(printf '%s' "$bindir/gh" | sed "s|$HOME|~|")  (real gh: $(printf '%s' "$rg" | sed "s|$HOME|~|"))"
+    else
+      d_bad "could not install the gh shim to $bindir/gh"; return 1
+    fi
+    printf '#!/bin/bash\n# compatibility forwarder — sshid folded gh-whoami into `sshid whoami`.\nexec sshid whoami "$@"\n' > "$bindir/gh-whoami"
+    chmod 0755 "$bindir/gh-whoami"
+    d_ok "gh-whoami forwards to 'sshid whoami'"
+    local first; first=$("$SHELL" -lc 'command -v gh' 2>/dev/null)
+    if [ -n "$first" ] && head -c 300 "$first" 2>/dev/null | grep -q 'sshid — per-repository gh account routing'; then
+      d_ok "your login shell finds the shim first"
+    else
+      d_warn "your login shell finds $first before the shim."
+      dim "     add to ~/.zshenv:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+  fi
+  echo; dim "next:  sshid adopt      (import routing already on this machine)"
+  dim "       sshid doctor"
+  return 0
+}
+
+cmd_undo(){
+  local yes=0 a; for a in "$@"; do [ "$a" = --yes ] && yes=1; done
+  local last; last=$(ls -1d "$BK"/*/ 2>/dev/null | grep -E '/[0-9]{8}-[0-9]{6}[^/]*/$' | sort | tail -1)
+  [ -n "$last" ] || { red "no snapshot to undo to"; return 1; }
+  [ -f "$last/gitconfig" ] || { red "$last has no gitconfig"; return 1; }
+  echo "restoring from $(printf '%s' "$last" | sed "s|$HOME|~|")"
+  diff "$GITCONFIG" "$last/gitconfig" | head -30 | sed 's/^/  /'
+  if [ "$yes" = 0 ]; then
+    if [ -t 0 ]; then printf 'restore it? [y/N] '; local ans; IFS= read -r ans
+      case "$ans" in y|Y|yes) ;; *) dim "left untouched."; return 0 ;; esac
+    else red "not a terminal — pass --yes to restore without asking"; return 2; fi
+  fi
+  man_lock || return 1
+  backup pre-undo >/dev/null
+  cp "$last/gitconfig" "$GITCONFIG"
+  [ -f "$last/identities.map" ] && cp "$last/identities.map" "$MANIFEST"
+  [ -f "$last/ssh_config" ] && cp "$last/ssh_config" "$SSHCONFIG"
+  [ -f "$last/gh-accounts.map" ] && cp "$last/gh-accounts.map" "$GHMAP"
+  [ -d "$last/identities" ] && cp "$last/identities"/*.gitconfig "$FRAGDIR/" 2>/dev/null
+  man_unlock; grn "restored."; return 0
+}
+
+cmd_import(){
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || { echo "usage: sshid import <file>"; return 2; }
+  man_lock || return 1; backup import >/dev/null
+  local tmp; tmp=$(mktemp)
+  # Re-validate EVERY field. The import path must not be the hole in the guard the
+  # interactive commands enforce.
+  local kind rest n bad=0
+  { printf '# sshid manifest\n'; } > "$tmp"
+  while IFS= read -r line || [ -n "${line:-}" ]; do
+    case "$line" in ''|\#*) continue ;; esac
+    kind=$(printf '%s' "$line" | cut -f1); rest=$(printf '%s' "$line" | cut -f2-)
+    case "$kind" in
+      identity|baseline) n=$(printf '%s' "$rest" | cut -f1) ;;
+      rule)              n=$(printf '%s' "$rest" | cut -f2) ;;
+      alias|ghid)        n=$(printf '%s' "$rest" | cut -f1) ;;
+      ghorg)             n="" ;;
+      *) yel "  skipped unknown record '$kind'"; continue ;;
+    esac
+    if [ -n "$n" ] && ! valid_name "$n"; then yel "  rejected invalid name '$n'"; bad=$((bad+1)); continue; fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$f"
+  mv -f "$tmp" "$MANIFEST"; chmod 0600 "$MANIFEST"
+  apply_all || { man_unlock; return 1; }
+  man_unlock; grn "imported ($bad rejected)"; return 0
+}
+
+# ── HELP ─────────────────────────────────────────────────────────────────────────────
+# Post-processor, not inline escapes: piped --help must be byte-identical plain text.
+colorize_help(){
+  # A POST-PROCESSOR, not inline escapes: piped --help must stay byte-identical plain
+  # text, and a heredoc full of \033 is unreadable to edit.
+  [ "$SSHID_COLOUR" = 1 ] || { cat; return; }
+  local B=$'\033[1m' G=$'\033[32m' C=$'\033[36m' D=$'\033[2m' U=$'\033[4;34m' O=$'\033[0m'
+  # ⚠ ORDER AND THE DIGIT GUARD BOTH MATTER. An ANSI escape is literally "ESC[32m", so a
+  # naive \[[^]]+\] matches the escapes THIS pipeline just inserted and paints garbage.
+  # Dim the placeholders first, and require the character after "[" not to be a digit so
+  # a real "[--flag]" matches while "[32m" never can.
+  sed -E \
+    -e "/^  [a-z]/ s/(<[a-z|:-]+>)/${D}\1${O}/g" \
+    -e "/^  [a-z]/ s/(\[[^]0-9][^]]*\])/${D}\1${O}/g" \
+    -e "/^  [a-z]/ s/^  ([a-z][a-z0-9-]*)/  ${G}${B}\1${O}/" \
+    -e "s/^([A-Z][A-Z /]+)\$/${B}\1${O}/" \
+    -e "s/\`([^\`]+)\`/${C}\1${O}/g" \
+    -e "s|(https?://[^ ]+)|${U}\1${O}|g"
+}
+
+cmd_help(){ colorize_help <<'SSHID_HELP_END'
+sshid — the right SSH key and gh account per repository, chosen by git itself.
+
+USAGE
+  sshid <command> [args]        sshid with no command runs `list`
+
+INSPECT
+  list [--probe] [--brief]      every identity: accounts, the folders and orgs bound
+                                to it, and how many repos use it
+  list --json                   the same, as one JSON object
+  whoami [path]                 what applies HERE, and why it was chosen
+  paths [name]                  every repository and which identity it uses
+  doctor                        health audit; exits non-zero when something is wrong
+  verify <name> [repo-url]      prove the key authenticates AND is authorised
+  impact <name>                 what breaks if <name> goes away
+  export                        rules and labels as TSV. Never keys, never tokens.
+
+SET UP
+  setup                         install the resolver and the gh shim (opt-in)
+  adopt                         import routing already on this machine, and prove
+                                every repo still resolves identically
+  add <name> [--type=ed25519]   create a key and record it as an identity
+                                (ed25519 by default; rsa and ecdsa also work)
+  add <name> --show-key         print just the public key, to pipe to pbcopy
+  route <name> --org <host:org> --proof <repo-url>
+                                bind an org to an identity, once proven
+  route <name> --dir <path>     bind a folder to an identity
+  unroute <name> --org|--dir    drop one rule
+  alias <name> [host]           add a Host entry for checking that identity
+
+GH
+  gh list                       accounts, org map, identity map
+  gh map <org> <account>        route an org's gh calls to an account
+  gh unmap <org>                stop routing that org
+  gh login                      log in an additional gh account
+
+TEAR DOWN
+  unbind <name>                 stop routing it; keep the key and the record
+  forget <name> [--force]       delete the identity; the key is kept by default
+  forget <name> --delete-key    ...and delete the private key too (irreversible)
+  undo [--yes]                  restore the last snapshot
+  import <file>                 replace the manifest from an export
+
+NOTES
+  Nothing is switched. git resolves the key from the repo on every command, so two
+  projects can push at once, as different accounts, and never interfere.
+
+  sshid does NOT bundle gh. The shim finds the gh you already have and exports a token
+  for one call; your logins and your active account are untouched.
+
+  Precedence is positional and last-match-wins: an org rule beats a folder rule, and
+  both beat the baseline. sshid keeps that ordering for you.
+SSHID_HELP_END
+exit 0; }
+
+# ── main ─────────────────────────────────────────────────────────────────────────────
+# ⚠ WRAPPED AND CALLED ON THE LAST LINE. bash reads a script by byte offset, so editing
+# this file while a long command is running makes it resume at a stale offset and execute
+# garbage. Defining main() and calling it at the end makes bash parse the whole file first.
+main(){
+  case "${1:-list}" in
+    list|ls|-l|--list)     shift 2>/dev/null; cmd_list "$@" ;;
+    paths)                 shift; cmd_paths "$@" ;;
+    whoami|who)            shift; cmd_whoami "$@" ;;
+    doctor)                shift; cmd_doctor "$@" ;;
+    verify)                shift; cmd_verify "$@" ;;
+    impact)                shift; cmd_impact "$@" ;;
+    export)                shift; cmd_export "$@" ;;
+    setup)                 shift; cmd_setup "$@" ;;
+    adopt)                 shift; cmd_adopt "$@" ;;
+    add)                   shift; cmd_add "$@" ;;
+    route)                 shift; cmd_route "$@" ;;
+    unroute)               shift; cmd_unroute "$@" ;;
+    unbind)                shift; cmd_unbind "$@" ;;
+    forget)                shift; cmd_forget "$@" ;;
+    alias)                 shift; cmd_alias "$@" ;;
+    gh)                    shift; cmd_gh "$@" ;;
+    undo)                  shift; cmd_undo "$@" ;;
+    import)                shift; cmd_import "$@" ;;
+    version|--version|-V)  echo "sshid $SSHID_VERSION" ;;
+    help|--help|-h)        cmd_help ;;
+    # `remove` and `delete` are near-synonyms of two DIFFERENT operations here, and an
+    # alias would preserve exactly the ambiguity the names were chosen to remove.
+    remove|rm|delete)
+      red "there is no 'remove' — it never said what it acted on."
+      echo "  sshid unbind <name>    stop routing it, keep the key"
+      echo "  sshid unroute <name> --org <host:org>    drop one rule"
+      echo "  sshid forget <name>    delete the identity"
+      exit 2 ;;
+    *) red "unknown command '${1:-}'"; echo "  sshid help"; exit 2 ;;
+  esac
+}
+main "$@"
