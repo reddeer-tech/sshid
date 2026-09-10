@@ -21,6 +21,20 @@ X backup "$T/b.tar.gz" >/dev/null 2>&1 && no "overwrote an existing file" || ok 
 tar -tzf "$T/b.tar.gz" | grep -q 'MANIFEST' && ok "carries a MANIFEST" || no "no MANIFEST"
 tar -xzOf "$T/b.tar.gz" 2>/dev/null | grep -qa 'PRIVATE KEY' && ok "carries the private keys (that is the point)" || no "no keys in the bundle"
 
+section "a path is optional, and you are always told where it went"
+out=$(X backup 2>&1)
+f=$(printf '%s' "$out" | grep -oE "$HOME/sshid-backup-[0-9-]+\.tar\.gz" | head -1)
+[ -n "$f" ] && [ -f "$f" ] && ok "no path: defaults under \$HOME and names the file" || no "no default file: $out"
+[ "$(stat -f %Lp "$f" 2>/dev/null)" = "600" ] && ok "the default bundle is 0600 too" || no "mode $(stat -f %Lp "$f" 2>/dev/null)"
+case "$f" in "$HOME/.config/"*) no "defaulted inside the config dir, which gets copied around" ;; *) ok "not inside the config dir" ;; esac
+printf '%s' "$out" | grep -qE '[0-9]+ bytes' && ok "reports the size" || no "no size reported"
+rm -f "$f"
+out=$(X export "$T/exp-to-file.tsv" 2>&1)
+[ -f "$T/exp-to-file.tsv" ] && ok "export takes a path too" || no "export to a file failed"
+printf '%s' "$out" | grep -q "$T/exp-to-file.tsv" && ok "and names the file it wrote" || no "did not name the file"
+X export "$T/exp-to-file.tsv" >/dev/null 2>&1 && no "export overwrote an existing file" || ok "export refuses to overwrite"
+X export 2>/dev/null | head -1 | grep -q 'sshid export' && ok "with no path it still goes to stdout, so it stays pipeable" || no "stdout form broken"
+
 section "export, by contrast, must NEVER carry key material"
 X export > "$T/e.tsv" 2>/dev/null
 grep -qaE 'PRIVATE KEY|BEGIN OPENSSH' "$T/e.tsv" && no "EXPORT LEAKED A PRIVATE KEY" || ok "export has no key material"

@@ -173,9 +173,13 @@ new public key on the account.
 ## Moving to another machine
 
 ```sh
-sshid backup ~/sshid.enc --encrypt     # on the old machine
-sshid restore ~/sshid.enc              # on the new one
+sshid backup --encrypt                 # on the old machine
+sshid restore ~/sshid-backup-<date>.tar.gz.enc     # on the new one
 ```
+
+Name a path if you want one; without one it writes to your home directory and tells you the
+full path and size. `sshid export [file]` does the same for the rules-only form, which stays
+on stdout when you give it no path so it can still be piped.
 
 This carries **the private keys**, unlike `export`, which is rules and labels only. The
 bundle is written mode 0600, and without `--encrypt` it says plainly that anyone who reads

@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.5"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.6"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -322,8 +322,16 @@ cmd_backup(){
       -*) red "unknown flag '$1'"; echo "  sshid backup <file> [--encrypt]"; return 2 ;;
       *) out="$1"; shift ;;
   esac; done
-  [ -n "$out" ] || { echo "usage: sshid backup <file> [--encrypt]"; return 2; }
+  # Default somewhere obvious and private rather than demanding a path. NOT inside
+  # ~/.config/sshid — that directory holds config-only snapshots and gets copied around;
+  # a bundle with private keys in it should not be somewhere you would sync by habit.
+  if [ -z "$out" ]; then
+    out="$HOME/sshid-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    [ "$enc" = 1 ] && out="${out%.tar.gz}.tar.gz.enc"
+  fi
   case "$out" in "~"*) out="$HOME${out#\~}" ;; esac
+  case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+  [ -d "$(dirname "$out")" ] || { red "no such directory: $(dirname "$out")"; return 1; }
   [ -e "$out" ] && { red "refusing to overwrite $out"; return 1; }
   command -v tar >/dev/null || { red "tar not found"; return 127; }
   [ "$enc" = 1 ] && { command -v openssl >/dev/null || { red "openssl not found — cannot encrypt"; return 127; }; }
@@ -369,7 +377,9 @@ cmd_backup(){
   fi
   chmod 0600 "$out" 2>/dev/null || true
   rm -rf "$stage"
-  grn "backed up $count key(s) and the routing to $(printf '%s' "$out" | sed "s|$HOME|~|")"
+  grn "backed up $count key(s) and the routing"
+  printf '  %s\n' "$out"
+  dim "  ($(wc -c < "$out" | tr -d ' ') bytes, mode $(stat -f %Lp "$out" 2>/dev/null))"
   if [ "$enc" = 1 ]; then dim "  encrypted; you will need that passphrase to restore it"
   else
     echo
@@ -474,6 +484,23 @@ PYR
 }
 
 cmd_export(){
+  local out="" a
+  for a in "$@"; do case "$a" in -*) red "unknown flag '$a'"; return 2 ;; *) out="$a" ;; esac; done
+  if [ -n "$out" ]; then
+    case "$out" in "~"*) out="$HOME${out#\~}" ;; esac
+    case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+    [ -d "$(dirname "$out")" ] || { red "no such directory: $(dirname "$out")"; return 1; }
+    [ -e "$out" ] && { red "refusing to overwrite $out"; return 1; }
+    ( umask 077; cmd_export_body > "$out" ) || return 1
+    chmod 0600 "$out" 2>/dev/null || true
+    grn "exported the routing (no keys, no tokens)"
+    printf '  %s\n' "$out"
+    dim "  ($(wc -c < "$out" | tr -d ' ') bytes) — restore with:  sshid import $(printf '%s' "$out" | sed "s|$HOME|~|")"
+    return 0
+  fi
+  cmd_export_body
+}
+cmd_export_body(){
   man_init
   printf '# sshid export — rules and labels. NO KEYS AND NO TOKENS.\n'
   local r
@@ -1429,8 +1456,10 @@ INSPECT
   doctor                        health audit; exits non-zero when something is wrong
   verify <name> [repo-url]      prove the key authenticates AND is authorised
   impact <name>                 what breaks if <name> goes away
-  export                        rules and labels as TSV. Never keys, never tokens.
-  backup <file> [--encrypt]     EVERYTHING, keys included — for moving machines
+  export [file]                 rules and labels as TSV. Never keys, never tokens.
+                                (to stdout, or to a file if you name one)
+  backup [file] [--encrypt]     EVERYTHING, keys included — for moving machines
+                                (defaults to ~/sshid-backup-<date>)
   restore <file> [--dry-run]    restore such a backup on another machine
 
 SET UP
