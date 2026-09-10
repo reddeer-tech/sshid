@@ -46,6 +46,25 @@ ssh-keygen -q -t ed25519 -N 'pw' -f "$T/src/locked" </dev/null
 X create locked --from "$T/src/locked" >/dev/null 2>&1 && no "accepted a passphrase-protected key" || ok "a passphrase-protected key is refused"
 for i in fromfile fromstdin fromtext nopub; do X forget $i --force --delete-key --yes >/dev/null 2>&1; done
 
+section "an unquoted pasted key explains itself instead of 'unknown flag'"
+# What actually happens when someone pastes a key without quotes: the shell splits it on
+# every space and newline, so --from gets "-----BEGIN" and the next word becomes an
+# unrecognised flag. The first complaint used to be "unknown flag 'OPENSSH'".
+ssh-keygen -q -t ed25519 -N '' -C p -f "$T/src/paste" </dev/null
+PK=$(cat "$T/src/paste")
+out=$(X create pasted1 --from $PK 2>&1)
+printf '%s' "$out" | grep -qi 'pasted without quotes' && ok "create names the real cause" || no "create said: $(printf '%s' "$out" | head -1)"
+printf '%s' "$out" | grep -q -- '--from -' && ok "and gives the stdin form that works" || no "no working alternative offered"
+[ -d "$HOME/.skm/pasted1" ] && no "created a key directory anyway" || ok "and wrote nothing"
+X create rk3 >/dev/null 2>&1
+out=$(X rekey rk3 --from $PK 2>&1)
+printf '%s' "$out" | grep -qi 'pasted without quotes' && ok "rekey does too" || no "rekey said: $(printf '%s' "$out" | head -1)"
+printf '%s' "$out" | grep -q 'sshid rekey' && ok "and names rekey, not create, in the advice" || no "wrong verb in the hint"
+# a real typo must still read as a typo
+out=$(X create typo1 --bogus 2>&1)
+printf '%s' "$out" | grep -q "unknown flag" && ok "a genuine bad flag is still just an unknown flag" || no "typo misreported as a paste"
+X forget rk3 --force --delete-key --yes >/dev/null 2>&1
+
 section "rekey --from replaces the key with one you supply"
 ssh-keygen -q -t ed25519 -N '' -C new -f "$T/src/new" </dev/null
 NEWFP=$(ssh-keygen -lf "$T/src/new.pub" | awk '{print $2}')

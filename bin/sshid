@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.8"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.9"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -905,8 +905,9 @@ cmd_create(){
       --from=*)       from="${1#--from=}"; shift ;;
       --from)         from="${2:-}"; shift 2 ;;
       --existing-key) adopt_key=1; shift ;;
-      *) red "unknown flag '$1'"
-         echo "  sshid create <name> [--type=ed25519|rsa|ecdsa] [--from <keyfile>] [--existing-key]"
+      *) if looks_like_key_material "$1"; then SSHID_VERB=create; pasted_key_hint "$n" "$1"; return 2; fi
+         red "unknown flag '$1'"
+         echo "  sshid create <name> [--type=ed25519|rsa|ecdsa] [--from <keyfile>|-] [--existing-key]"
          return 2 ;;
   esac; done
   [ -n "$n" ] || { echo "usage: sshid add <name> [--type=ed25519|rsa] [--existing-key]"; return 2; }
@@ -914,6 +915,10 @@ cmd_create(){
   reserved_name "$n" && { red "'$n' is a reserved word"; return 2; }
   man_has "$n" && { red "identity '$n' already exists"; dim "  sshid impact $n     to see what uses it"; return 1; }
   [ -n "$from" ] && [ "$adopt_key" = 1 ] && { red "--from and --existing-key do different things; pick one"; return 2; }
+  # --from holding the OPENING LINE of a key but not a whole key means the paste was split
+  case "$from" in
+    -----BEGIN*) printf '%s' "$from" | grep -q 'PRIVATE KEY' || { SSHID_VERB=create; pasted_key_hint "$n" "$from"; return 2; } ;;
+  esac
   local kdir="$KEYDIR/$n" k
   k=$(keyfile_for "$n")
   if [ -n "$k" ] && [ "$adopt_key" = 0 ]; then
@@ -981,6 +986,36 @@ split_org(){
   [ -n "$ORG_HOST" ] && [ -n "$ORG_NAME" ]
 }
 
+# A pasted key that was not quoted arrives as dozens of arguments, because the shell splits
+# on every space and newline. The first useful complaint is then "unknown flag 'OPENSSH'",
+# which tells the user nothing. Recognise the wreckage and say what actually happened.
+looks_like_key_material(){
+  case "$1" in
+    # the structural words of a key header, which is what the split leaves behind:
+    # "-----BEGIN OPENSSH PRIVATE KEY-----" becomes four separate arguments
+    -----BEGIN*|-----END*|BEGIN|END|OPENSSH|PRIVATE|KEY|KEY-----|*PRIVATE*KEY*) return 0 ;;
+    ssh-rsa|ssh-ed25519|ecdsa-sha2-*) return 0 ;;
+  esac
+  # a long unbroken base64 run is the body of a key and nothing else a user types
+  case "$1" in
+    *[!A-Za-z0-9+/=]*) return 1 ;;
+    ??????????????????????????????????????????*) return 0 ;;
+  esac
+  return 1
+}
+pasted_key_hint(){ # <name> <the offending argument>
+  red "that looks like an ssh key pasted without quotes."
+  dim "  The shell splits it on every space and newline, so only the first word reached"
+  dim "  --from. Multi-line text is fragile as an argument even when quoted, because the"
+  dim "  terminal treats each newline as Enter. Read it from stdin instead:"
+  echo
+  dim "    pbpaste | sshid ${SSHID_VERB:-create} $1 --from -"
+  dim "    sshid ${SSHID_VERB:-create} $1 --from ~/path/to/the/keyfile"
+  echo
+  dim "  or paste interactively and finish with Ctrl-D:"
+  dim "    sshid ${SSHID_VERB:-create} $1 --from -"
+}
+
 # ── ingesting a key from a file, stdin, or pasted text ───────────────────────────────
 # One path for `create --from` and `rekey --from`, so the two cannot validate differently.
 # Sets INGEST_KEY (the installed private key) and INGEST_TYPE.
@@ -1005,10 +1040,12 @@ ingest_key(){ # <name> <source>
       printf '%s\n' "$src" > "$tmp"
       yel "  the key was passed as an argument, which is visible in \`ps\` and in shell history."
       dim "     next time:  pbpaste | sshid ... --from -      (or --from <file>)"
+    elif looks_like_key_material "$src"; then
+      rm -f "$tmp"; pasted_key_hint "$n" "$src"; return 1
     else
       red "no such key file: $src"
       dim "  --from takes a path, or - to read the key from stdin:"
-      dim "    pbpaste | sshid create $n --from -"
+      dim "    pbpaste | sshid ${SSHID_VERB:-create} $n --from -"
       rm -f "$tmp"; return 1
     fi
   fi
@@ -1160,7 +1197,8 @@ cmd_rekey(){
   while [ $# -gt 0 ]; do case "$1" in
       --type=*) type="${1#--type=}"; shift ;; --type) type="${2:-}"; shift 2 ;;
       --from=*) from="${1#--from=}"; shift ;; --from) from="${2:-}"; shift 2 ;;
-      *) red "unknown flag '$1'"
+      *) if looks_like_key_material "$1"; then SSHID_VERB=rekey; pasted_key_hint "$n" "$1"; return 2; fi
+         red "unknown flag '$1'"
          echo "  sshid rekey <name> [--type=ed25519|rsa|ecdsa] [--from <file>|-]"; return 2 ;;
   esac; done
   [ -n "$n" ] || { echo "usage: sshid rekey <name> [--type=ed25519|rsa|ecdsa]"; return 2; }
