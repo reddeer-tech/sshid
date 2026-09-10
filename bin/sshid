@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.3"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.4"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -723,6 +723,20 @@ cmd_create(){
 }
 
 # Prints ONLY the public key, so it pipes straight to pbcopy. Never the private one.
+# Split an --org value into host and org. Accepts "github.com:acme", "github.com/acme"
+# and a bare "acme" (defaults to github.com). ORG_HOST and ORG_NAME are set.
+ORG_HOST=""; ORG_NAME=""
+split_org(){
+  local v="$1"
+  case "$v" in
+    *:*) ORG_HOST="${v%%:*}"; ORG_NAME="${v#*:}" ;;
+    */*) ORG_HOST="${v%%/*}"; ORG_NAME="${v#*/}" ;;
+    *)   ORG_HOST="github.com"; ORG_NAME="$v" ;;
+  esac
+  ORG_NAME="${ORG_NAME%/}"
+  [ -n "$ORG_HOST" ] && [ -n "$ORG_NAME" ]
+}
+
 cmd_pubkey(){
   local n="${1:-}"
   [ -n "$n" ] || { echo "usage: sshid pubkey <name>"; return 2; }
@@ -750,6 +764,7 @@ cmd_bind(){
   # RULE: never route a key that has not been PROVEN to reach the repos. ssh -T only
   # proves authentication; a key can authenticate perfectly and be denied every repo.
   if [ -n "$org" ]; then
+    split_org "$org" || { red "could not read --org '$org' (use host:org, host/org, or just the org)"; return 2; }
     if [ -n "$proof" ]; then
       cmd_verify "$n" "$proof" || { red "not binding '$n' — the proof failed"; return 1; }
     elif [ "$force" = 0 ]; then
@@ -766,10 +781,19 @@ cmd_bind(){
   man_lock || return 1
   backup "route-$n" >/dev/null
   [ -n "$dir" ] && { dir="${dir%/}"; case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac
+    case "$dir" in /*) ;; *) dir="$(cd "$dir" 2>/dev/null && pwd -P)" || dir="$PWD/$dir" ;; esac
+    if [ -d "$dir" ]; then
+      # git matches the PHYSICAL path, so a folder reached through a symlink would never
+      # match the rule we wrote. Store what git will actually see.
+      local real; real=$(cd "$dir" 2>/dev/null && pwd -P) && [ -n "$real" ] && dir="$real"
+    else
+      yel "  note: $(printf '%s' "$dir" | sed "s|$HOME|~|") does not exist yet — the rule is written, but it matches nothing until it does"
+    fi
     man_del "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"
     man_add "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"; }
-  [ -n "$org" ] && { local h o; h="${org%%:*}"; o="${org#*:}"
-    [ "$h" = "$o" ] && { h=github.com; o="$org"; }
+  [ -n "$org" ] && { local h o
+    split_org "$org" || { red "could not read --org '$org' (use host:org, host/org, or just the org)"; man_unlock; return 2; }
+    h="$ORG_HOST"; o="$ORG_NAME"
     man_del "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"
     man_add "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"
     # gh routes on the org too, and org is consulted before identity — so an org rule
@@ -810,7 +834,9 @@ cmd_unbind(){
   fi
   man_lock || return 1; backup "unbind-$n" >/dev/null
   [ -n "$dir" ] && { dir="${dir%/}"; case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac; man_del "$(printf 'rule\tdir\t%s\t%s' "$n" "$dir")"; }
-  [ -n "$org" ] && { local h o; h="${org%%:*}"; o="${org#*:}"; [ "$h" = "$o" ] && { h=github.com; o="$org"; }
+  [ -n "$org" ] && { local h o
+    split_org "$org" || { red "could not read --org '$org'"; man_unlock; return 2; }
+    h="$ORG_HOST"; o="$ORG_NAME"
     man_del "$(printf 'rule\torg\t%s\t%s\t%s' "$n" "$h" "$o")"; }
   apply_all || { man_unlock; return 1; }
   man_unlock; grn "unbound"; return 0
@@ -820,6 +846,42 @@ cmd_unbind(){
 # record, every rule that names it, the ssh alias (including the Host name itself), the gh
 # identity row, and the fragment. Miss one and the identity is half-renamed — which looks
 # like working routing right up until the moment it silently uses the wrong key.
+# The fallback key: what a repository uses when no binding matches. Without one, git falls
+# back to its own ssh defaults (~/.ssh/id_rsa and whatever ssh-agent offers), which is the
+# ambiguity this tool exists to remove — so it is worth setting deliberately.
+cmd_baseline(){
+  local a="${1:-}"
+  local cur; cur=$(man_baseline)
+  if [ -z "$a" ]; then
+    if [ -n "$cur" ]; then
+      printf '  %s %s\n' "$(cell 14 'baseline')" "$(cell 22 "$cur" 32)"
+      dim "  repositories that match no binding use this key"
+    else
+      yel "  no baseline set"
+      dim "  repositories that match no binding fall back to git's own ssh defaults"
+      dim "  set one:  sshid baseline <name>"
+    fi
+    return 0
+  fi
+  man_lock || return 1
+  backup "baseline-$a" >/dev/null
+  if [ "$a" = "--none" ] || [ "$a" = "none" ]; then
+    man_del baseline
+    apply_all || { man_unlock; return 1; }
+    man_unlock
+    grn "baseline cleared"
+    dim "  unmatched repositories now fall back to git's own ssh defaults"
+    return 0
+  fi
+  man_has "$a" || { red "unknown identity '$a'"; dim "  sshid list     to see them"; man_unlock; return 1; }
+  man_del baseline; man_add "$(printf 'baseline\t%s' "$a")"
+  apply_all || { man_unlock; return 1; }
+  man_unlock
+  grn "baseline is now '$a'"
+  dim "  every repository that matches no binding uses it"
+  return 0
+}
+
 cmd_rename(){
   local old="${1:-}" new="${2:-}"
   [ -n "$old" ] && [ -n "$new" ] || { echo "usage: sshid rename <old> <new>"; return 2; }
@@ -895,15 +957,28 @@ cmd_forget(){
     [ "$(ident_from_cmd "$(git -C "$r" config core.sshCommand 2>/dev/null)")" = "$n" ] && used=$((used+1))
   done < <(repos)
   if [ "$used" -gt 0 ] && [ "$force" = 0 ]; then
-    cmd_impact "$n"; red "refusing: $used repo(s) still use '$n'. Re-route them, or pass --force."; return 1
+    cmd_impact "$n"; red "refusing: $used repo(s) still use '$n'. Re-bind them, or pass --force."; return 1
+  fi
+  # Removing the baseline is a bigger deal than removing any other identity: EVERY
+  # repository that matches no binding depends on it.
+  local isbase=0; [ "$(man_baseline)" = "$n" ] && isbase=1
+  if [ "$isbase" = 1 ] && [ "$force" = 0 ]; then
+    red "refusing: '$n' is the baseline — every repository that matches no binding uses it."
+    dim "  point it somewhere else first:  sshid baseline <other>"
+    dim "  or clear it entirely:           sshid baseline --none"
+    dim "  or force it, and the baseline is cleared with it:  sshid forget $n --force"
+    return 1
   fi
   man_lock || return 1; local bk; bk=$(backup "forget-$n")
   man_del "$(printf 'rule\tdir\t%s' "$n")"; man_del "$(printf 'rule\torg\t%s' "$n")"
   man_del "$(printf 'identity\t%s' "$n")"; man_del "$(printf 'alias\t%s' "$n")"; man_del "$(printf 'ghid\t%s' "$n")"
+  # never leave the baseline naming something that no longer exists
+  [ "$isbase" = 1 ] && man_del baseline
   rm -f "$FRAGDIR/$n.gitconfig"
   apply_all || { man_unlock; return 1; }
   man_unlock
   grn "forgot identity '$n'  (backup: $(printf '%s' "$bk" | sed "s|$HOME|~|"))"
+  [ "$isbase" = 1 ] && yel "  it was the baseline, so the baseline is now unset — unmatched repositories fall back to git's own ssh defaults"
   if [ "$delkey" = 1 ]; then
     # ⚠ IRREVERSIBLE, AND NOT ONLY HERE. The key store may be synced, so this can remove
     # the key from other machines too, and no backup in this tool contains key material —
@@ -1131,6 +1206,7 @@ SET UP
   unbind <name> --all           remove every binding; keep the key and the record
   alias <name> [host]           add a Host entry for checking that identity
   rename <old> <new>            rename an identity; key, rules and gh mapping follow
+  baseline [<name>|--none]      the fallback key for repositories nothing else matches
 
 GH
   gh list                       accounts, org map, identity map
@@ -1183,6 +1259,7 @@ main(){
              echo "  sshid bind ${2:-<name>} --dir <path>"; exit 2 ;;
     unroute) red "'unroute' is now 'unbind'."; echo "  sshid unbind ${2:-<name>} --org <host:org>"
              echo "  sshid unbind ${2:-<name>} --all      remove every binding"; exit 2 ;;
+    baseline)              shift; cmd_baseline "$@" ;;
     rename)                shift; cmd_rename "$@" ;;
     forget)                shift; cmd_forget "$@" ;;
     alias)                 shift; cmd_alias "$@" ;;

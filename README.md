@@ -70,6 +70,16 @@ PATH that works out the account per call and passes a token to that one invocati
 the tokens already in your keyring — no re-login, and your active account never moves. If
 you don't have `gh` at all, `setup` says so and skips it; SSH routing works regardless.
 
+### The fallback key
+
+A repository that matches nothing uses the **baseline** — one identity you nominate:
+
+```sh
+sshid baseline personal     # what unmatched repositories use
+sshid baseline              # show the current one
+sshid baseline --none       # clear it; git falls back to its own ssh defaults
+```
+
 Keys live in `~/.ssh/sshid/<name>/` by default. If you already keep them elsewhere,
 `sshid` uses that instead — point `SSHID_KEYDIR` at it, or let `sshid adopt` find them.
 
@@ -93,22 +103,56 @@ sshid doctor        # exits non-zero when something is actually wrong
 
 ## Adding an identity
 
+Create the key, put it on the account, bind it to a folder. That's the whole flow:
 
 ```sh
-sshid create example                  # make the key. Nothing is bound to it yet.
-sshid pubkey example | pbcopy         # register the public key on the account
+sshid create example                       # make the key; nothing is bound to it yet
+sshid pubkey example | pbcopy              # register the public key on the account
+sshid bind example --dir ~/code/example    # bind it to a folder — done
+
+# optional, and usually unnecessary:
 sshid bind example --org github.com:example-org \
                    --proof git@github.com:example-org/some-repo.git
-sshid bind example --dir ~/code/example      # optional: also bind a folder
 ```
 
-The key has to exist before anything can be bound to it, so `create` comes first. Binding a
-**folder** contacts nothing. Binding an **organisation** requires `--proof`.
+After the third line, every repository under `~/code/example` uses that key — including
+ones that have no remote yet. Nothing else is required.
 
-The `--proof` is not ceremony. An SSH key can authenticate perfectly and still be denied
-every repository on an account, and when that happens git reports `repository not found` —
-which reads as a wrong URL and is almost always a wrong identity. `sshid` will not route
-an organisation until it has watched the key actually reach a real repository there.
+`--org` takes `host:org`, `host/org`, or just `org` (which assumes github.com).
+
+### When you'd want the optional org binding
+
+A folder binding says *"repositories in this directory"*. An org binding says
+*"repositories belonging to this organisation, wherever they happen to be on disk"*.
+
+Two reasons to add one:
+
+- a repository of theirs lives outside the folder — cloned to a scratch directory, say —
+  and you still want the right key
+- a **third-party** repository is cloned *inside* your folder. An org binding beats a
+  folder binding, so that repository keeps its own key instead of silently borrowing yours
+
+If everything for that account lives in one folder, skip it.
+
+### Why the org binding needs `--proof`
+
+Binding a folder contacts nothing. It is a statement about files on your own disk, and it
+cannot be wrong in a way that surprises you — so nothing is checked.
+
+Binding an organisation is a claim about a remote server: *this key can reach that org's
+repositories.* That claim is easy to get wrong and it fails misleadingly. An SSH key can
+authenticate perfectly — the server greets you by name — and still be denied every
+repository on the account, because authenticating and being authorised are different
+things. When that happens git says:
+
+```
+ERROR: Repository not found.
+```
+
+which reads like a typo in the URL and is almost always the wrong identity. So `sshid`
+will not bind an organisation until it has watched the key reach a real repository there.
+`--proof` takes any repository URL in that org; `sshid` makes one read-only request and
+refuses the binding if it fails. `--force` skips the check if you have a reason to.
 
 ## Undoing things
 

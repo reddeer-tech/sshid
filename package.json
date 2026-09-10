@@ -1,6 +1,6 @@
 {
   "name": "ssh-persona",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Route SSH keys and gh accounts per repository on macOS \u2014 the right identity per project, chosen by git itself, with nothing global to switch. Installs the `sshid` command.",
   "keywords": [
     "ssh",

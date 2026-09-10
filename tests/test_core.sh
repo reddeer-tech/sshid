@@ -120,6 +120,59 @@ printf '%s' "$out" | grep -qi 'PRIVATE' && no "LEAKED PRIVATE KEY MATERIAL" || o
 X pubkey nosuch >/dev/null 2>&1 && no "pubkey on unknown identity succeeded" || ok "unknown identity refused"
 X forget pk --force >/dev/null 2>&1
 
+section "bind --dir resolves the path git will actually match"
+# git matches the PHYSICAL path, so a folder reached through a symlink never matches a rule
+# written with the symlink path — the rule looks right and silently covers nothing.
+mkdir -p "$HOME/projects/RealDir"; ln -sfn "$HOME/projects/RealDir" "$HOME/projects/LinkDir"
+X create linky >/dev/null 2>&1
+X bind linky --dir "$HOME/projects/LinkDir" >/dev/null 2>&1
+mkrepo "$HOME/projects/RealDir/repo"
+[ "$(resolved "$HOME/projects/RealDir/repo")" = linky ] && ok "a symlinked --dir still matches the real repo" || no "got: $(resolved "$HOME/projects/RealDir/repo")"
+out=$(X bind linky --dir "$HOME/projects/DoesNotExist" 2>&1)
+printf '%s' "$out" | grep -qi 'does not exist' && ok "warns about a folder that does not exist yet" || no "silent about a nonexistent folder"
+X forget linky --force >/dev/null 2>&1
+
+section "baseline: the fallback for repositories nothing else matches"
+mkrepo "$HOME/projects/Unmatched/repo" "origin=git@github.com:nobody/x.git"
+[ -z "$(resolved "$HOME/projects/Unmatched/repo")" ] && ok "with no baseline, an unmatched repo gets no key from us" || no "unexpected: $(resolved "$HOME/projects/Unmatched/repo")"
+X baseline 2>&1 | grep -q 'no baseline set' && ok "says so when unset" || no "did not report an unset baseline"
+X create fallbackkey >/dev/null 2>&1
+X baseline fallbackkey >/dev/null 2>&1
+[ "$(resolved "$HOME/projects/Unmatched/repo")" = fallbackkey ] && ok "setting it routes every unmatched repo" || no "got: $(resolved "$HOME/projects/Unmatched/repo")"
+X whoami "$HOME/projects/Unmatched/repo" | grep -q 'baseline' && ok "whoami says it came from the baseline, not a rule" || no "whoami does not name the baseline"
+X baseline | grep -q fallbackkey && ok "reports the current baseline" || no "does not report it"
+# a binding must still beat it
+X create beater >/dev/null 2>&1; X bind beater --dir "$HOME/projects/Unmatched" >/dev/null 2>&1
+[ "$(resolved "$HOME/projects/Unmatched/repo")" = beater ] && ok "a binding beats the baseline" || no "baseline won over a binding"
+X unbind beater --all >/dev/null 2>&1
+X baseline --none >/dev/null 2>&1
+[ -z "$(resolved "$HOME/projects/Unmatched/repo")" ] && ok "--none clears it" || no "still set: $(resolved "$HOME/projects/Unmatched/repo")"
+X baseline nosuch >/dev/null 2>&1 && no "accepted an unknown identity" || ok "refuses an unknown identity"
+
+# Removing the baseline used to leave the record pointing at a deleted identity, so the
+# generated [core] sshCommand named a key nothing owned — and with --delete-key, one that
+# no longer existed.
+X create basekey >/dev/null 2>&1; X baseline basekey >/dev/null 2>&1
+X forget basekey >/dev/null 2>&1 && no "forgot the baseline without --force" || ok "refuses to forget the baseline unforced"
+[ "$(resolved "$HOME/projects/Unmatched/repo")" = basekey ] && ok "the refusal changed nothing" || no "refusal damaged the baseline"
+X forget basekey --force >/dev/null 2>&1
+grep -q '^baseline' "$HOME/.config/sshid/identities.map" && no "baseline record left dangling" || ok "--force clears the baseline with it"
+[ -z "$(resolved "$HOME/projects/Unmatched/repo")" ] && ok "no dangling key reference in ~/.gitconfig" || no "still points at: $(resolved "$HOME/projects/Unmatched/repo")"
+git config --file "$HOME/.gitconfig" --list >/dev/null 2>&1 && ok "config still parses" || no "broken config"
+X forget fallbackkey --force >/dev/null 2>&1; X forget beater --force >/dev/null 2>&1
+
+section "--org accepts the forms people actually type"
+X create orgforms >/dev/null 2>&1
+for form in "github.com:acme-a" "github.com/acme-b" "acme-c" "gitlab.com:grp-d"; do
+  X bind orgforms --org "$form" --force >/dev/null 2>&1
+done
+grep -q 'git@github.com:acme-a/\*\*' "$HOME/.gitconfig" && ok "host:org" || no "host:org"
+grep -q 'git@github.com:acme-b/\*\*' "$HOME/.gitconfig" && ok "host/org" || no "host/org"
+grep -q 'git@github.com:acme-c/\*\*' "$HOME/.gitconfig" && ok "bare org defaults to github.com" || no "bare org"
+grep -q 'git@gitlab.com:grp-d/\*\*' "$HOME/.gitconfig" && ok "a non-github host is kept" || no "gitlab host"
+git config --file "$HOME/.gitconfig" --list >/dev/null 2>&1 && ok "all four produce valid git config" || no "invalid config"
+X forget orgforms --force >/dev/null 2>&1
+
 section "rename moves EVERYTHING that names the identity"
 # Six things have to move together: the key dir, the identity record, every rule, the ssh
 # alias (including the Host name), the gh row, and the fragment. Missing one leaves a
