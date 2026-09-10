@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.4"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.5"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -308,6 +308,168 @@ cmd_impact(){
   else
     grn "VERDICT: nothing routes to it — safe to remove."
   fi
+  return 0
+}
+
+# ── moving to another machine ─────────────────────────────────────────────────────────
+# ⚠ THIS ONE CONTAINS PRIVATE KEYS. `export` deliberately does not — it is rules and labels
+# only, safe to paste anywhere. `backup` is the opposite: it is the whole secret, so it is
+# written 0600, it says so in plain words, and --encrypt is one flag away.
+cmd_backup(){
+  local out="" enc=0
+  while [ $# -gt 0 ]; do case "$1" in
+      --encrypt) enc=1; shift ;;
+      -*) red "unknown flag '$1'"; echo "  sshid backup <file> [--encrypt]"; return 2 ;;
+      *) out="$1"; shift ;;
+  esac; done
+  [ -n "$out" ] || { echo "usage: sshid backup <file> [--encrypt]"; return 2; }
+  case "$out" in "~"*) out="$HOME${out#\~}" ;; esac
+  [ -e "$out" ] && { red "refusing to overwrite $out"; return 1; }
+  command -v tar >/dev/null || { red "tar not found"; return 127; }
+  [ "$enc" = 1 ] && { command -v openssl >/dev/null || { red "openssl not found — cannot encrypt"; return 127; }; }
+
+  local stage; stage=$(mktemp -d) || return 1
+  chmod 0700 "$stage"
+  mkdir -p "$stage/keys"
+  local n k count=0
+  while IFS= read -r n; do [ -n "$n" ] || continue
+    k=$(keyfile_for "$n") || true
+    [ -n "$k" ] || continue
+    mkdir -p "$stage/keys/$n"
+    cp "$k" "$stage/keys/$n/" 2>/dev/null && count=$((count+1))
+    [ -f "$k.pub" ] && cp "$k.pub" "$stage/keys/$n/" 2>/dev/null
+  done < <(man_names)
+  [ -f "$MANIFEST" ] && cp "$MANIFEST" "$stage/identities.map"
+  [ -f "$GHMAP" ] && cp "$GHMAP" "$stage/gh-accounts.map"
+  { printf 'sshid-backup 1\nversion\t%s\ncreated\t%s\nkeys\t%s\nhome\t%s\n' \
+      "$SSHID_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$count" "$HOME"
+    while IFS= read -r n; do [ -n "$n" ] || continue
+      k=$(keyfile_for "$n") || true; [ -n "$k" ] || continue
+      printf 'fingerprint\t%s\t%s\n' "$n" "$(ssh-keygen -lf "$k.pub" 2>/dev/null | awk '{print $2}')"
+    done < <(man_names)
+  } > "$stage/MANIFEST"
+  chmod -R go-rwx "$stage" 2>/dev/null || true
+
+  if [ "$enc" = 1 ]; then
+    local pw pw2
+    if [ -t 0 ]; then
+      printf '  passphrase: ' >&2; IFS= read -rs pw; printf '\n' >&2
+      printf '  again:      ' >&2; IFS= read -rs pw2; printf '\n' >&2
+      [ "$pw" = "$pw2" ] || { red "passphrases did not match — nothing written"; rm -rf "$stage"; return 1; }
+    else
+      IFS= read -r pw   # non-interactive: one line on stdin
+    fi
+    [ -n "$pw" ] || { red "empty passphrase — nothing written"; rm -rf "$stage"; return 1; }
+    if ! ( umask 077; tar -czf - -C "$stage" . \
+           | openssl enc -aes-256-cbc -pbkdf2 -salt -pass fd:3 -out "$out" 3< <(printf '%s' "$pw") ); then
+      red "encryption failed — nothing written"; rm -f "$out"; rm -rf "$stage"; return 1; fi
+    unset pw pw2
+  else
+    ( umask 077; tar -czf "$out" -C "$stage" . ) || { rm -f "$out"; rm -rf "$stage"; return 1; }
+  fi
+  chmod 0600 "$out" 2>/dev/null || true
+  rm -rf "$stage"
+  grn "backed up $count key(s) and the routing to $(printf '%s' "$out" | sed "s|$HOME|~|")"
+  if [ "$enc" = 1 ]; then dim "  encrypted; you will need that passphrase to restore it"
+  else
+    echo
+    red "  ⚠ THIS FILE CONTAINS YOUR PRIVATE KEYS, UNENCRYPTED."
+    dim "     Anyone who reads it can act as every account these keys reach."
+    dim "     It is mode 0600. Do not put it in a repo, a shared folder, or cloud sync."
+    dim "     Next time:  sshid backup <file> --encrypt"
+  fi
+  dim "  restore it with:  sshid restore $(printf '%s' "$out" | sed "s|$HOME|~|")"
+  return 0
+}
+
+cmd_restore(){
+  local in="" dry=0 force=0
+  while [ $# -gt 0 ]; do case "$1" in
+      --dry-run) dry=1; shift ;;
+      --force)   force=1; shift ;;
+      -*) red "unknown flag '$1'"; echo "  sshid restore <file> [--dry-run] [--force]"; return 2 ;;
+      *) in="$1"; shift ;;
+  esac; done
+  [ -n "$in" ] || { echo "usage: sshid restore <file> [--dry-run] [--force]"; return 2; }
+  case "$in" in "~"*) in="$HOME${in#\~}" ;; esac
+  [ -f "$in" ] || { red "no such file: $in"; return 1; }
+
+  local stage; stage=$(mktemp -d) || return 1; chmod 0700 "$stage"
+  # An encrypted bundle is not a gzip, so try plain first and fall back rather than making
+  # the user remember which one they made.
+  if ! tar -xzf "$in" -C "$stage" 2>/dev/null; then
+    command -v openssl >/dev/null || { red "not a readable backup, and openssl is missing"; rm -rf "$stage"; return 1; }
+    local pw
+    if [ -t 0 ]; then printf '  passphrase: ' >&2; IFS= read -rs pw; printf '\n' >&2
+    else IFS= read -r pw; fi
+    if ! openssl enc -d -aes-256-cbc -pbkdf2 -in "$in" -pass fd:3 3< <(printf '%s' "$pw") 2>/dev/null \
+         | tar -xzf - -C "$stage" 2>/dev/null; then
+      red "could not read that backup (wrong passphrase, or not an sshid backup)"; unset pw; rm -rf "$stage"; return 1
+    fi
+    unset pw
+  fi
+  [ -f "$stage/MANIFEST" ] || { red "not an sshid backup: no MANIFEST inside"; rm -rf "$stage"; return 1; }
+  head -1 "$stage/MANIFEST" | grep -q '^sshid-backup ' || { red "unrecognised backup format"; rm -rf "$stage"; return 1; }
+
+  echo "  from $(awk -F'\t' '$1=="created"{print $2}' "$stage/MANIFEST"), sshid $(awk -F'\t' '$1=="version"{print $2}' "$stage/MANIFEST")"
+  local n clash=0 newk=0
+  for d in "$stage"/keys/*/; do [ -d "$d" ] || continue
+    n=$(basename "$d")
+    if [ -n "$(keyfile_for "$n")" ]; then
+      printf '    %-24s %s\n' "$n" "$(dim_inline 'already here — will be kept unless --force')"; clash=$((clash+1))
+    else
+      printf '    %-24s %s\n' "$n" "restore"; newk=$((newk+1))
+    fi
+  done
+  if [ "$dry" = 1 ]; then dim "  --dry-run: nothing written ($newk to restore, $clash already present)"; rm -rf "$stage"; return 0; fi
+  if [ "$clash" -gt 0 ] && [ "$force" = 0 ]; then
+    yel "  $clash identit(y|ies) already exist here and will be left alone."
+    dim "  --force overwrites them with the backup's keys."
+  fi
+
+  man_lock || { rm -rf "$stage"; return 1; }
+  backup "restore" >/dev/null
+  mkdir -p "$KEYDIR"
+  for d in "$stage"/keys/*/; do [ -d "$d" ] || continue
+    n=$(basename "$d")
+    [ -n "$(keyfile_for "$n")" ] && [ "$force" = 0 ] && continue
+    mkdir -p "$KEYDIR/$n"; chmod 0700 "$KEYDIR/$n"
+    cp "$d"/* "$KEYDIR/$n/" 2>/dev/null
+    chmod 0600 "$KEYDIR/$n"/id_* 2>/dev/null || true
+    chmod 0644 "$KEYDIR/$n"/*.pub 2>/dev/null || true
+  done
+  # The manifest names key paths from the OTHER machine; rewrite them for this one.
+  if [ -f "$stage/identities.map" ]; then
+    local oldhome; oldhome=$(awk -F'\t' '$1=="home"{print $2}' "$stage/MANIFEST")
+    python3 - "$stage/identities.map" "$KEYDIR" "$HOME" "${oldhome:-}" > "$MANIFEST" <<'PYR'
+import sys, os
+src, keydir, newhome, oldhome = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+moved = []
+for line in open(src, encoding='utf-8', errors='replace').read().splitlines():
+    f = line.split('	')
+    if f and f[0] == 'identity' and len(f) > 2 and f[2]:
+        f[2] = os.path.join(keydir, f[1], os.path.basename(f[2]))
+        line = '	'.join(f)
+    elif f and f[0] == 'rule' and len(f) > 3 and f[1] == 'dir' and oldhome:
+        p = f[3]
+        # only relocate paths that lived under the other machine's home; an absolute path
+        # outside it (a shared volume, say) is left exactly as written.
+        if p == oldhome or p.startswith(oldhome.rstrip('/') + '/'):
+            f[3] = newhome.rstrip('/') + p[len(oldhome.rstrip('/')):]
+            moved.append(f[3])
+            line = '	'.join(f)
+    print(line)
+if moved:
+    sys.stderr.write('  relocated %d folder binding(s) from the old home\n' % len(moved))
+PYR
+    chmod 0600 "$MANIFEST"
+  fi
+  [ -f "$stage/gh-accounts.map" ] && { mkdir -p "$FRAGDIR"; cp "$stage/gh-accounts.map" "$GHMAP"; chmod 0600 "$GHMAP"; }
+  rm -rf "$stage"
+  apply_all || { man_unlock; return 1; }
+  man_unlock
+  grn "restored"
+  dim "  check:  sshid list     sshid doctor"
   return 0
 }
 
@@ -670,12 +832,22 @@ PYS
 # ── ADD / ROUTE ──────────────────────────────────────────────────────────────────────
 cmd_create(){
   local n="${1:-}"; shift 2>/dev/null || true
-  local type=ed25519 adopt_key=0 a
-  for a in "$@"; do case "$a" in --type=*) type="${a#--type=}" ;; --existing-key) adopt_key=1 ;; esac; done
+  local type="" adopt_key=0 from="" a
+  while [ $# -gt 0 ]; do case "$1" in
+      --type=*)       type="${1#--type=}"; shift ;;
+      --type)         type="${2:-}"; shift 2 ;;
+      --from=*)       from="${1#--from=}"; shift ;;
+      --from)         from="${2:-}"; shift 2 ;;
+      --existing-key) adopt_key=1; shift ;;
+      *) red "unknown flag '$1'"
+         echo "  sshid create <name> [--type=ed25519|rsa|ecdsa] [--from <keyfile>] [--existing-key]"
+         return 2 ;;
+  esac; done
   [ -n "$n" ] || { echo "usage: sshid add <name> [--type=ed25519|rsa] [--existing-key]"; return 2; }
   valid_name "$n" || { red "invalid name '$n' — lowercase letters, digits, . _ - ; must start alphanumeric; max 39"; return 2; }
   reserved_name "$n" && { red "'$n' is a reserved word"; return 2; }
   man_has "$n" && { red "identity '$n' already exists"; dim "  sshid impact $n     to see what uses it"; return 1; }
+  [ -n "$from" ] && [ "$adopt_key" = 1 ] && { red "--from and --existing-key do different things; pick one"; return 2; }
   local kdir="$KEYDIR/$n" k
   k=$(keyfile_for "$n")
   if [ -n "$k" ] && [ "$adopt_key" = 0 ]; then
@@ -688,9 +860,31 @@ cmd_create(){
   fi
   man_lock || return 1
   backup "add-$n" >/dev/null
-  if [ "$adopt_key" = 1 ]; then
+  if [ -n "$from" ]; then
+    case "$from" in "~"*) from="$HOME${from#\~}" ;; esac
+    [ -f "$from" ] || { red "no such key file: $from"; man_unlock; return 1; }
+    # A passphrase is fatal here, not cosmetic: routing runs with IdentityAgent=none, so
+    # there is no agent to cache one and git would prompt on every single command.
+    if ! ssh-keygen -y -P "" -f "$from" >/dev/null 2>&1; then
+      red "that key is passphrase-protected, and routing cannot use one."
+      dim "  routing runs with IdentityAgent=none, so there is no agent to cache it and git"
+      dim "  would prompt on every command. Remove it first:  ssh-keygen -p -f $from"
+      man_unlock; return 1
+    fi
+    local ktype; ktype=$(ssh-keygen -lf "$from" 2>/dev/null | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p' | tr 'A-Z' 'a-z')
+    [ -n "$ktype" ] || { red "could not read that file as an ssh private key"; man_unlock; return 1; }
+    mkdir -p "$kdir"; chmod 0700 "$kdir"
+    k="$kdir/id_$ktype"
+    cp "$from" "$k" && chmod 0600 "$k" || { red "could not copy the key"; man_unlock; return 1; }
+    if [ -f "$from.pub" ]; then cp "$from.pub" "$k.pub"
+    else ssh-keygen -y -P "" -f "$k" > "$k.pub" 2>/dev/null; fi
+    chmod 0644 "$k.pub" 2>/dev/null || true
+    grn "imported $ktype key -> $(printf '%s' "$k" | sed "s|$HOME|~|")"
+    dim "  fingerprint $(ssh-keygen -lf "$k.pub" 2>/dev/null | awk '{print $2}')"
+  elif [ "$adopt_key" = 1 ]; then
     [ -n "$k" ] || { red "no key at $kdir to adopt"; man_unlock; return 1; }
   else
+    type="${type:-ed25519}"
     mkdir -p "$kdir"; chmod 0700 "$kdir"
     # Empty passphrase is REQUIRED, not lazy: routing uses IdentityAgent=none, so there is
     # no agent to cache one and a passphrase means a prompt on every single git command.
@@ -849,6 +1043,51 @@ cmd_unbind(){
 # The fallback key: what a repository uses when no binding matches. Without one, git falls
 # back to its own ssh defaults (~/.ssh/id_rsa and whatever ssh-agent offers), which is the
 # ambiguity this tool exists to remove — so it is worth setting deliberately.
+# A NEW key for an identity that already exists, keeping every binding. The old key is
+# retired, never deleted: no backup this tool writes contains key material, so destroying
+# it here would be unrecoverable.
+cmd_rekey(){
+  local n="${1:-}"; shift 2>/dev/null || true
+  local type=ed25519 a
+  while [ $# -gt 0 ]; do case "$1" in
+      --type=*) type="${1#--type=}"; shift ;; --type) type="${2:-}"; shift 2 ;;
+      *) red "unknown flag '$1'"; echo "  sshid rekey <name> [--type=ed25519|rsa|ecdsa]"; return 2 ;;
+  esac; done
+  [ -n "$n" ] || { echo "usage: sshid rekey <name> [--type=ed25519|rsa|ecdsa]"; return 2; }
+  man_has "$n" || { red "unknown identity '$n'"; return 1; }
+  local old; old=$(keyfile_for "$n")
+  man_lock || return 1
+  local bk; bk=$(backup "rekey-$n")
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  if [ -n "$old" ]; then
+    mkdir -p "$KEYDIR/$n/retired-$stamp"
+    mv "$old" "$KEYDIR/$n/retired-$stamp/" 2>/dev/null
+    [ -f "$old.pub" ] && mv "$old.pub" "$KEYDIR/$n/retired-$stamp/" 2>/dev/null
+  fi
+  if ! ssh-keygen -q -t "$type" -N '' -C "$n" -f "$KEYDIR/$n/id_$type" </dev/null; then
+    red "ssh-keygen failed — restoring the previous key"
+    [ -n "$old" ] && mv "$KEYDIR/$n/retired-$stamp/"* "$KEYDIR/$n/" 2>/dev/null
+    rmdir "$KEYDIR/$n/retired-$stamp" 2>/dev/null
+    man_unlock; return 1
+  fi
+  local new="$KEYDIR/$n/id_$type"
+  # the identity record carries the key path, and the type may have changed
+  local rec; rec=$(man_get identity | awk -F'\t' -v x="$n" '$1==x{print;exit}')
+  man_del "$(printf 'identity\t%s' "$n")"
+  man_add "$(printf 'identity\t%s\t%s\t%s\t%s' "$n" "$new" "$(man_field "$rec" 3)" "$(man_field "$rec" 4)")"
+  apply_all || { man_unlock; return 1; }
+  man_unlock
+  grn "rekeyed '$n'"
+  dim "  new key      $(printf '%s' "$new" | sed "s|$HOME|~|")"
+  dim "  fingerprint  $(ssh-keygen -lf "$new.pub" 2>/dev/null | awk '{print $2}')"
+  dim "  old key      $(printf '%s' "$KEYDIR/$n/retired-$stamp" | sed "s|$HOME|~|")  (kept — no backup here holds key material)"
+  echo
+  yel "  '$n' will FAIL until you register the new public key on the account:"
+  dim "    sshid pubkey $n | pbcopy"
+  dim "  then remove the old key from that account."
+  return 0
+}
+
 cmd_baseline(){
   local a="${1:-}"
   local cur; cur=$(man_baseline)
@@ -1191,6 +1430,8 @@ INSPECT
   verify <name> [repo-url]      prove the key authenticates AND is authorised
   impact <name>                 what breaks if <name> goes away
   export                        rules and labels as TSV. Never keys, never tokens.
+  backup <file> [--encrypt]     EVERYTHING, keys included — for moving machines
+  restore <file> [--dry-run]    restore such a backup on another machine
 
 SET UP
   setup                         install the resolver and the gh shim (opt-in)
@@ -1198,6 +1439,8 @@ SET UP
                                 every repo still resolves identically
   create <name> [--type=rsa]    make a key and record it as an identity
                                 (ed25519 by default; rsa and ecdsa also work)
+  create <name> --from <file>   import a key from elsewhere; type is detected
+  rekey <name> [--type=]        replace an identity's key, keeping every binding
   pubkey <name>                 print its public key, to pipe to pbcopy
   bind <name> --org <host:org> --proof <repo-url>
                                 bind an org to an identity, once proven
@@ -1245,6 +1488,8 @@ main(){
     verify)                shift; cmd_verify "$@" ;;
     impact)                shift; cmd_impact "$@" ;;
     export)                shift; cmd_export "$@" ;;
+    backup)                shift; cmd_backup "$@" ;;
+    restore)               shift; cmd_restore "$@" ;;
     setup)                 shift; cmd_setup "$@" ;;
     adopt)                 shift; cmd_adopt "$@" ;;
     create)                shift; cmd_create "$@" ;;
@@ -1259,6 +1504,7 @@ main(){
              echo "  sshid bind ${2:-<name>} --dir <path>"; exit 2 ;;
     unroute) red "'unroute' is now 'unbind'."; echo "  sshid unbind ${2:-<name>} --org <host:org>"
              echo "  sshid unbind ${2:-<name>} --all      remove every binding"; exit 2 ;;
+    rekey)                 shift; cmd_rekey "$@" ;;
     baseline)              shift; cmd_baseline "$@" ;;
     rename)                shift; cmd_rename "$@" ;;
     forget)                shift; cmd_forget "$@" ;;

@@ -154,6 +154,38 @@ will not bind an organisation until it has watched the key reach a real reposito
 `--proof` takes any repository URL in that org; `sshid` makes one read-only request and
 refuses the binding if it fails. `--force` skips the check if you have a reason to.
 
+## Replacing or importing a key
+
+```sh
+sshid create work --from ~/keys/id_ed25519   # a key from another machine; type is detected
+sshid rekey work                             # a fresh key, keeping every binding
+```
+
+`--from` works out the key type itself and rebuilds the public half if it is missing. It
+refuses a passphrase-protected key, because routing runs without an agent and git would
+prompt on every command.
+
+`rekey` replaces the key and keeps every binding, so nothing needs re-binding. The old key is
+moved aside rather than deleted — no backup this tool writes contains key material, so
+destroying it here would be unrecoverable. The identity stops working until you register the
+new public key on the account.
+
+## Moving to another machine
+
+```sh
+sshid backup ~/sshid.enc --encrypt     # on the old machine
+sshid restore ~/sshid.enc              # on the new one
+```
+
+This carries **the private keys**, unlike `export`, which is rules and labels only. The
+bundle is written mode 0600, and without `--encrypt` it says plainly that anyone who reads
+the file can act as every account those keys reach.
+
+`restore` puts the keys back, rewrites key paths for the new machine, and relocates folder
+bindings that lived under the old home — a folder binding is an absolute path, so left alone
+it would be present, look right, and match nothing. It will not overwrite an identity that
+already exists unless you pass `--force`, and `--dry-run` shows what it would do.
+
 ## Undoing things
 
 Every change is snapshotted first, and `sshid undo` restores the last one.

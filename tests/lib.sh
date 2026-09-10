@@ -104,7 +104,12 @@ mkrepo(){ local p="$1"; shift; mkdir -p "$p"; git -C "$p" init -q -b main 2>/dev
   local kv; for kv in "$@"; do git -C "$p" remote add "${kv%%=*}" "${kv#*=}" 2>/dev/null; done; }
 
 # Which identity does git itself resolve for this repo? Empty = no rule matched.
-resolved(){ git -C "$1" config core.sshCommand 2>/dev/null | sed -n 's|.*\.skm/\([^/]*\)/.*|\1|p'; }
+# The identity is the directory the key sits in, whatever the key store is called. Matching
+# a literal ".skm" here made this helper return empty for any other store — which showed up
+# as a code failure when the code was fine.
+resolved(){ local c k; c=$(git -C "$1" config core.sshCommand 2>/dev/null)
+  k=$(printf '%s' "$c" | sed -n 's|.*-i \([^ ]*\).*|\1|p'); [ -n "$k" ] || return 0
+  k=${k%/*}; printf '%s' "${k##*/}"; }
 # Which FILE decided it — the baseline or a fragment. This is the real diagnostic.
 resolved_by(){ git -C "$1" config --show-origin core.sshCommand 2>/dev/null | awk '{print $1}'; }
 
