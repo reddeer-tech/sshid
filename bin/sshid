@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.7"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.8"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -927,25 +927,9 @@ cmd_create(){
   man_lock || return 1
   backup "add-$n" >/dev/null
   if [ -n "$from" ]; then
-    case "$from" in "~"*) from="$HOME${from#\~}" ;; esac
-    [ -f "$from" ] || { red "no such key file: $from"; man_unlock; return 1; }
-    # A passphrase is fatal here, not cosmetic: routing runs with IdentityAgent=none, so
-    # there is no agent to cache one and git would prompt on every single command.
-    if ! ssh-keygen -y -P "" -f "$from" >/dev/null 2>&1; then
-      red "that key is passphrase-protected, and routing cannot use one."
-      dim "  routing runs with IdentityAgent=none, so there is no agent to cache it and git"
-      dim "  would prompt on every command. Remove it first:  ssh-keygen -p -f $from"
-      man_unlock; return 1
-    fi
-    local ktype; ktype=$(ssh-keygen -lf "$from" 2>/dev/null | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p' | tr 'A-Z' 'a-z')
-    [ -n "$ktype" ] || { red "could not read that file as an ssh private key"; man_unlock; return 1; }
-    mkdir -p "$kdir"; chmod 0700 "$kdir"
-    k="$kdir/id_$ktype"
-    cp "$from" "$k" && chmod 0600 "$k" || { red "could not copy the key"; man_unlock; return 1; }
-    if [ -f "$from.pub" ]; then cp "$from.pub" "$k.pub"
-    else ssh-keygen -y -P "" -f "$k" > "$k.pub" 2>/dev/null; fi
-    chmod 0644 "$k.pub" 2>/dev/null || true
-    grn "imported $ktype key -> $(printf '%s' "$k" | sed "s|$HOME|~|")"
+    ingest_key "$n" "$from" || { man_unlock; return 1; }
+    k="$INGEST_KEY"
+    grn "imported $INGEST_TYPE key -> $(printf '%s' "$k" | sed "s|$HOME|~|")"
     dim "  fingerprint $(ssh-keygen -lf "$k.pub" 2>/dev/null | awk '{print $2}')"
   elif [ "$adopt_key" = 1 ]; then
     [ -n "$k" ] || { red "no key at $kdir to adopt"; man_unlock; return 1; }
@@ -995,6 +979,64 @@ split_org(){
   esac
   ORG_NAME="${ORG_NAME%/}"
   [ -n "$ORG_HOST" ] && [ -n "$ORG_NAME" ]
+}
+
+# ── ingesting a key from a file, stdin, or pasted text ───────────────────────────────
+# One path for `create --from` and `rekey --from`, so the two cannot validate differently.
+# Sets INGEST_KEY (the installed private key) and INGEST_TYPE.
+#
+# ⚠ argv IS NOT PRIVATE. A key pasted as an argument is visible in `ps` to every process on
+# the machine and lands in shell history. It is supported because refusing it just makes
+# people write it to a file and forget to delete that, but it warns, and `-` (stdin) is the
+# form the docs give.
+INGEST_KEY=""; INGEST_TYPE=""
+ingest_key(){ # <name> <source>
+  local n="$1" src="$2" tmp rc=0
+  INGEST_KEY=""; INGEST_TYPE=""
+  tmp=$(mktemp) || return 1
+  chmod 0600 "$tmp"
+  if [ "$src" = "-" ]; then
+    cat > "$tmp"
+  else
+    case "$src" in "~"*) src="$HOME${src#\~}" ;; esac
+    if [ -f "$src" ]; then
+      cat "$src" > "$tmp"
+    elif printf '%s' "$src" | grep -q 'PRIVATE KEY'; then
+      printf '%s\n' "$src" > "$tmp"
+      yel "  the key was passed as an argument, which is visible in \`ps\` and in shell history."
+      dim "     next time:  pbpaste | sshid ... --from -      (or --from <file>)"
+    else
+      red "no such key file: $src"
+      dim "  --from takes a path, or - to read the key from stdin:"
+      dim "    pbpaste | sshid create $n --from -"
+      rm -f "$tmp"; return 1
+    fi
+  fi
+  [ -s "$tmp" ] || { red "no key material given"; rm -f "$tmp"; return 1; }
+  # A passphrase is fatal, not cosmetic: routing runs with IdentityAgent=none, so there is
+  # no agent to cache one and git would prompt on every command.
+  if ! ssh-keygen -y -P "" -f "$tmp" >/dev/null 2>&1; then
+    if ssh-keygen -lf "$tmp" >/dev/null 2>&1; then
+      red "that key is passphrase-protected, and routing cannot use one."
+      dim "  remove it first:  ssh-keygen -p -f <the key file>"
+    else
+      red "that does not read as an ssh private key."
+      dim "  expected an OpenSSH private key (the file that has no .pub on the end)"
+    fi
+    rm -f "$tmp"; return 1
+  fi
+  INGEST_TYPE=$(ssh-keygen -lf "$tmp" 2>/dev/null | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p' | tr 'A-Z' 'a-z')
+  [ -n "$INGEST_TYPE" ] || { red "could not determine the key type"; rm -f "$tmp"; return 1; }
+  mkdir -p "$KEYDIR/$n"; chmod 0700 "$KEYDIR/$n"
+  INGEST_KEY="$KEYDIR/$n/id_$INGEST_TYPE"
+  cp "$tmp" "$INGEST_KEY" && chmod 0600 "$INGEST_KEY" || rc=1
+  if [ "$rc" = 0 ]; then
+    if [ "$src" != "-" ] && [ -f "$src.pub" ]; then cp "$src.pub" "$INGEST_KEY.pub"
+    else ssh-keygen -y -P "" -f "$INGEST_KEY" > "$INGEST_KEY.pub" 2>/dev/null; fi
+    chmod 0644 "$INGEST_KEY.pub" 2>/dev/null || true
+  fi
+  rm -f "$tmp"
+  return $rc
 }
 
 cmd_pubkey(){
@@ -1114,10 +1156,12 @@ cmd_unbind(){
 # it here would be unrecoverable.
 cmd_rekey(){
   local n="${1:-}"; shift 2>/dev/null || true
-  local type=ed25519 a
+  local type=ed25519 from="" a
   while [ $# -gt 0 ]; do case "$1" in
       --type=*) type="${1#--type=}"; shift ;; --type) type="${2:-}"; shift 2 ;;
-      *) red "unknown flag '$1'"; echo "  sshid rekey <name> [--type=ed25519|rsa|ecdsa]"; return 2 ;;
+      --from=*) from="${1#--from=}"; shift ;; --from) from="${2:-}"; shift 2 ;;
+      *) red "unknown flag '$1'"
+         echo "  sshid rekey <name> [--type=ed25519|rsa|ecdsa] [--from <file>|-]"; return 2 ;;
   esac; done
   [ -n "$n" ] || { echo "usage: sshid rekey <name> [--type=ed25519|rsa|ecdsa]"; return 2; }
   man_has "$n" || { red "unknown identity '$n'"; return 1; }
@@ -1130,20 +1174,31 @@ cmd_rekey(){
     mv "$old" "$KEYDIR/$n/retired-$stamp/" 2>/dev/null
     [ -f "$old.pub" ] && mv "$old.pub" "$KEYDIR/$n/retired-$stamp/" 2>/dev/null
   fi
-  if ! ssh-keygen -q -t "$type" -N '' -C "$n" -f "$KEYDIR/$n/id_$type" </dev/null; then
-    red "ssh-keygen failed — restoring the previous key"
-    [ -n "$old" ] && mv "$KEYDIR/$n/retired-$stamp/"* "$KEYDIR/$n/" 2>/dev/null
-    rmdir "$KEYDIR/$n/retired-$stamp" 2>/dev/null
-    man_unlock; return 1
+  local new
+  if [ -n "$from" ]; then
+    if ! ingest_key "$n" "$from"; then
+      red "  the previous key has been put back"
+      [ -n "$old" ] && mv "$KEYDIR/$n/retired-$stamp/"* "$KEYDIR/$n/" 2>/dev/null
+      rmdir "$KEYDIR/$n/retired-$stamp" 2>/dev/null
+      man_unlock; return 1
+    fi
+    new="$INGEST_KEY"; type="$INGEST_TYPE"
+  else
+    if ! ssh-keygen -q -t "$type" -N '' -C "$n" -f "$KEYDIR/$n/id_$type" </dev/null; then
+      red "ssh-keygen failed — restoring the previous key"
+      [ -n "$old" ] && mv "$KEYDIR/$n/retired-$stamp/"* "$KEYDIR/$n/" 2>/dev/null
+      rmdir "$KEYDIR/$n/retired-$stamp" 2>/dev/null
+      man_unlock; return 1
+    fi
+    new="$KEYDIR/$n/id_$type"
   fi
-  local new="$KEYDIR/$n/id_$type"
   # the identity record carries the key path, and the type may have changed
   local rec; rec=$(man_get identity | awk -F'\t' -v x="$n" '$1==x{print;exit}')
   man_del "$(printf 'identity\t%s' "$n")"
   man_add "$(printf 'identity\t%s\t%s\t%s\t%s' "$n" "$new" "$(man_field "$rec" 3)" "$(man_field "$rec" 4)")"
   apply_all || { man_unlock; return 1; }
   man_unlock
-  grn "rekeyed '$n'"
+  grn "rekeyed '$n'${from:+ (from the key you supplied)}"
   dim "  new key      $(printf '%s' "$new" | sed "s|$HOME|~|")"
   dim "  fingerprint  $(ssh-keygen -lf "$new.pub" 2>/dev/null | awk '{print $2}')"
   dim "  old key      $(printf '%s' "$KEYDIR/$n/retired-$stamp" | sed "s|$HOME|~|")  (kept — no backup here holds key material)"
@@ -1507,8 +1562,9 @@ SET UP
                                 every repo still resolves identically
   create <name> [--type=rsa]    make a key and record it as an identity
                                 (ed25519 by default; rsa and ecdsa also work)
-  create <name> --from <file>   import a key from elsewhere; type is detected
+  create <name> --from <file>   import a key; use - to read it from stdin
   rekey <name> [--type=]        replace an identity's key, keeping every binding
+  rekey <name> --from <file>|-  ...with one you supply instead of a fresh one
   pubkey <name>                 print its public key, to pipe to pbcopy
   bind <name> --org <host:org> --proof <repo-url>
                                 bind an org to an identity, once proven

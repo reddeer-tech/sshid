@@ -23,6 +23,42 @@ X create acme >/dev/null 2>&1 && no "overwrote a key that was not in the manifes
 [ "$(shasum -a 256 "$HOME/.skm/acme/id_ed25519" | cut -d' ' -f1)" = "$before" ] && ok "the existing key is byte-identical" || no "KEY WAS OVERWRITTEN"
 X create acme --existing-key >/dev/null 2>&1 && ok "--existing-key adopts it instead" || no "--existing-key failed"
 
+section "supplying a key: file, stdin, or pasted text"
+mkdir -p "$T/src"
+ssh-keygen -q -t rsa -b 2048 -N '' -C src -f "$T/src/k" </dev/null
+SRCFP=$(ssh-keygen -lf "$T/src/k.pub" | awk '{print $2}')
+kf(){ ls "$HOME/.skm/$1"/id_* 2>/dev/null | grep -v '\.pub$' | head -1; }
+X create fromfile --from "$T/src/k" >/dev/null 2>&1
+[ "$(ssh-keygen -lf "$(kf fromfile).pub" 2>/dev/null | awk '{print $2}')" = "$SRCFP" ] && ok "--from <file> imports that exact key" || no "file import"
+[ "$(basename "$(kf fromfile)")" = "id_rsa" ] && ok "the key type is detected, not assumed" || no "type: $(basename "$(kf fromfile)")"
+cat "$T/src/k" | X create fromstdin --from - >/dev/null 2>&1
+[ "$(ssh-keygen -lf "$(kf fromstdin).pub" 2>/dev/null | awk '{print $2}')" = "$SRCFP" ] && ok "--from - reads a pasted key from stdin" || no "stdin import"
+out=$(X create fromtext --from "$(cat "$T/src/k")" 2>&1)
+[ "$(ssh-keygen -lf "$(kf fromtext).pub" 2>/dev/null | awk '{print $2}')" = "$SRCFP" ] && ok "--from <pasted text> works too" || no "text import"
+printf '%s' "$out" | grep -qi 'visible in' && ok "and warns that argv is visible in ps and history" || no "no warning about argv"
+# the public half is rebuilt when only the private key is supplied
+rm -f "$T/src/k.pub"
+X create nopub --from "$T/src/k" >/dev/null 2>&1
+[ -f "$(kf nopub).pub" ] && ok "the public half is rebuilt when it is missing" || no "no .pub generated"
+X create junk --from "definitely not a key" >/dev/null 2>&1 && no "accepted garbage" || ok "garbage is refused"
+[ -d "$HOME/.skm/junk" ] && no "garbage created a key directory" || ok "and wrote nothing"
+ssh-keygen -q -t ed25519 -N 'pw' -f "$T/src/locked" </dev/null
+X create locked --from "$T/src/locked" >/dev/null 2>&1 && no "accepted a passphrase-protected key" || ok "a passphrase-protected key is refused"
+for i in fromfile fromstdin fromtext nopub; do X forget $i --force --delete-key --yes >/dev/null 2>&1; done
+
+section "rekey --from replaces the key with one you supply"
+ssh-keygen -q -t ed25519 -N '' -C new -f "$T/src/new" </dev/null
+NEWFP=$(ssh-keygen -lf "$T/src/new.pub" | awk '{print $2}')
+X create rk2 >/dev/null 2>&1; X bind rk2 --dir "$HOME/projects/Rk2" >/dev/null 2>&1
+mkrepo "$HOME/projects/Rk2/repo"
+cat "$T/src/new" | X rekey rk2 --from - >/dev/null 2>&1
+[ "$(ssh-keygen -lf "$(kf rk2).pub" 2>/dev/null | awk '{print $2}')" = "$NEWFP" ] && ok "the supplied key replaced the generated one" || no "key not replaced"
+[ "$(resolved "$HOME/projects/Rk2/repo")" = rk2 ] && ok "the binding survived the replacement" || no "binding lost"
+prev=$(ssh-keygen -lf "$(kf rk2).pub" | awk '{print $2}')
+X rekey rk2 --from /does/not/exist >/dev/null 2>&1 && no "accepted a bad --from" || ok "a bad --from is refused"
+[ "$(ssh-keygen -lf "$(kf rk2).pub" 2>/dev/null | awk '{print $2}')" = "$prev" ] && ok "and the previous key is put back" || no "KEY LOST on a failed rekey"
+X forget rk2 --force --delete-key --yes >/dev/null 2>&1
+
 section "create: name validation happens before anything is written"
 for bad in BAD_NAME 'a b' 'x!' '-lead' none global ''; do
   n=$(ls "$HOME/.skm" | wc -l)

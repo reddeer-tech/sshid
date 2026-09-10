@@ -161,9 +161,17 @@ sshid create work --from ~/keys/id_ed25519   # a key from another machine; type 
 sshid rekey work                             # a fresh key, keeping every binding
 ```
 
-`--from` works out the key type itself and rebuilds the public half if it is missing. It
-refuses a passphrase-protected key, because routing runs without an agent and git would
-prompt on every command.
+`--from` takes a file, or `-` to read the key from stdin — which is how you paste one:
+
+```sh
+pbpaste | sshid create work --from -
+pbpaste | sshid rekey  work --from -    # replace an existing identity's key
+```
+
+It works out the key type itself and rebuilds the public half if only the private key is
+supplied. A passphrase-protected key is refused, because routing runs without an agent and
+git would prompt on every command. Passing the key as an argument works too, but it warns:
+an argument is visible in `ps` to every process and lands in your shell history.
 
 `rekey` replaces the key and keeps every binding, so nothing needs re-binding. The old key is
 moved aside rather than deleted — no backup this tool writes contains key material, so
