@@ -11,7 +11,7 @@
 # dangerous here than a missed upstream error.
 set -u
 
-SSHID_VERSION="1.0.6"   # kept in step with package.json by `make version`
+SSHID_VERSION="1.0.7"   # kept in step with package.json by `make version`
 
 # ── find lib.sh / resolve.sh ─────────────────────────────────────────────────────────
 # Follow symlinks FIRST: Homebrew links bin/sshid -> ../Cellar/…, npm links into
@@ -653,6 +653,23 @@ cmd_adopt(){
   python3 - "$GITCONFIG" "$KEYDIR" > "$parsed" <<'PY'
 import re, sys, os
 gc, keydir = sys.argv[1], sys.argv[2]
+keydir = os.path.realpath(os.path.expanduser(keydir))
+
+def fragment_is_ours(path):
+    """True only if that include actually routes ssh to a key in the key store."""
+    p = os.path.expanduser(path)
+    if not os.path.isabs(p):
+        p = os.path.join(os.path.dirname(os.path.abspath(gc)), p)
+    try:
+        body = open(p, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return False
+    m = re.search(r'sshCommand\s*=\s*.*?-i\s+(\S+)', body)
+    if not m:
+        return False
+    k = os.path.realpath(os.path.expanduser(m.group(1)))
+    return k.startswith(keydir + os.sep)
+
 txt = open(gc, encoding='utf-8', errors='replace').read().splitlines()
 out, sec, buf = [], None, []
 def flush(sec, buf):
@@ -667,6 +684,12 @@ def flush(sec, buf):
         frag = os.path.basename(path)
         if not frag.endswith('.gitconfig'): return
         name = frag[:-len('.gitconfig')]
+        # ⚠ THE FILENAME IS NOT ENOUGH. The commonest includeIf on any machine is a
+        # per-folder COMMIT IDENTITY (`path = ~/work.gitconfig` setting user.email) and it
+        # has nothing to do with ssh keys. Importing one invents a phantom identity; the
+        # matching strip would delete a setting we do not own. Open the file and require it
+        # to point a key at the key store — that is the only honest test.
+        if not fragment_is_ours(path): return
         d = re.match(r'gitdir/i?:(.+)$', cond)
         if d:
             p = d.group(1).rstrip('/')
@@ -749,11 +772,27 @@ PY
   local stripped; stripped=$(mktemp)
   python3 - "$GITCONFIG" "$KEYDIR" > "$stripped" <<'PY'
 import re, sys, os
-lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
-keydir = os.path.expanduser(sys.argv[2]).rstrip('/')
+gcpath = sys.argv[1]
+lines = open(gcpath, encoding='utf-8', errors='replace').read().splitlines()
+keydir = os.path.realpath(os.path.expanduser(sys.argv[2]))
 def ours(line):
     m = re.match(r'\s*sshCommand\s*=\s*.*?-i\s+(\S+)', line)
-    return bool(m) and os.path.expanduser(m.group(1)).startswith(keydir + '/')
+    if not m: return False
+    return os.path.realpath(os.path.expanduser(m.group(1))).startswith(keydir + os.sep)
+def include_is_ours(body):
+    """Same test the importer used: only strip an include we actually adopted."""
+    for b in body:
+        pm = re.match(r'\s*path\s*=\s*(.+?)\s*$', b)
+        if not pm: continue
+        p = os.path.expanduser(pm.group(1))
+        if not os.path.isabs(p):
+            p = os.path.join(os.path.dirname(os.path.abspath(gcpath)), p)
+        try: frag = open(p, encoding='utf-8', errors='replace').read()
+        except OSError: return False
+        m = re.search(r'sshCommand\s*=\s*.*?-i\s+(\S+)', frag)
+        if not m: return False
+        return os.path.realpath(os.path.expanduser(m.group(1))).startswith(keydir + os.sep)
+    return False
 out, i = [], 0
 while i < len(lines):
     m = re.match(r'\s*\[(.+?)\]\s*$', lines[i])
@@ -762,7 +801,7 @@ while i < len(lines):
         while j < len(lines) and not re.match(r'\s*\[(.+?)\]\s*$', lines[j]):
             body.append(lines[j]); j += 1
         drop = False
-        if sec.startswith('includeIf ') and any(re.match(r'\s*path\s*=\s*.*identities/.*\.gitconfig\s*$', b) for b in body):
+        if sec.startswith('includeIf ') and include_is_ours(body):
             drop = True
         elif sec == 'core':
             keep = [b for b in body if not ours(b)]

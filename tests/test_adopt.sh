@@ -78,6 +78,30 @@ X adopt --no-probe --force >/dev/null 2>&1
 X list --no-count | grep -q spare && ok "an unrouted key is still recorded as an identity" || no "unrouted key dropped"
 X doctor 2>&1 | grep -q 'ZERO rules' && ok "doctor names the unroutable identity" || no "doctor silent about the orphan"
 
+section "adopt only claims includes that actually route ssh"
+# Two failures this guards, both found by trying a layout other than the author's:
+#  1. a fragment kept outside ~/.config/git/identities was imported but NOT stripped, so
+#     every adopt added a duplicate rule
+#  2. the commonest includeIf on any machine is a per-folder COMMIT IDENTITY setting
+#     user.email. Judging by filename alone invented a phantom identity from it, and the
+#     matching strip would have deleted a setting sshid does not own.
+mkkey outside rsa
+printf '[core]\n\tsshCommand = ssh -i %s/.skm/outside/id_rsa\n' "$HOME" > "$HOME/elsewhere.gitconfig"
+printf '[user]\n\temail = me@work.example\n' > "$HOME/commit-identity.gitconfig"
+{ printf '\n[includeIf "gitdir/i:%s/projects/Outside/"]\n\tpath = %s/elsewhere.gitconfig\n' "$HOME" "$HOME"
+  printf '[includeIf "gitdir/i:%s/projects/CommitId/"]\n\tpath = %s/commit-identity.gitconfig\n' "$HOME" "$HOME"; } >> "$HOME/.gitconfig"
+mkrepo "$HOME/projects/Outside/repo"; mkrepo "$HOME/projects/CommitId/repo"
+X adopt --no-probe --force >/dev/null 2>&1
+[ "$(resolved "$HOME/projects/Outside/repo")" = outside ] && ok "a fragment stored elsewhere is adopted and still routes" || no "got: $(resolved "$HOME/projects/Outside/repo")"
+n1=$(grep -c 'projects/Outside' "$HOME/.gitconfig"); X adopt --no-probe --force >/dev/null 2>&1
+[ "$(grep -c 'projects/Outside' "$HOME/.gitconfig")" = "$n1" ] && ok "adopting it twice does not duplicate the rule" || no "duplicated: $n1 -> $(grep -c 'projects/Outside' "$HOME/.gitconfig")"
+[ "$(git -C "$HOME/projects/CommitId/repo" config user.email)" = "me@work.example" ] && ok "a commit-identity include is left working" || no "commit identity broken: [$(git -C "$HOME/projects/CommitId/repo" config user.email)]"
+grep -q 'commit-identity.gitconfig' "$HOME/.gitconfig" && ok "and its include is not stripped" || no "STRIPPED an include sshid does not own"
+grep -q 'commit-identity' "$HOME/.config/sshid/identities.map" && no "invented a phantom identity from it" || ok "no phantom identity invented"
+# The commit-identity include is now legitimately part of the user's own config and is
+# deliberately never stripped, so it becomes part of what "unmanaged" means from here on.
+UNMANAGED_BEFORE=$(unmanaged_snapshot)
+
 section "adopt is IDEMPOTENT — running it again must not grow anything"
 # Found on the real machine: adopt stripped hand-written gitconfig rules but not
 # hand-written ~/.ssh/config aliases, so it re-read its OWN generated block as "existing
